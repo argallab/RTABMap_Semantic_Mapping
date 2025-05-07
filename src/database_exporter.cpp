@@ -40,8 +40,9 @@ DatabaseExporter::DatabaseExporter(std::string rtabmap_database_name,
     std::cout << "Loading model: " << model_path_ << std::endl;
 
     net_ = cv::dnn::readNet(model_path_);
-    lidar_used = false;
   }
+
+  lidar_used = lidar;
 
   // base path
   std::string path = std::string(PROJECT_PATH) + "/output/" + timestamp_;
@@ -486,10 +487,7 @@ Result DatabaseExporter::load_rtabmap_db()
     return result;
   }
 
-  lidar_used = true;
-  std::cout << "Lidar used is " << lidar_used << ".\n";
-
-  if (true) {
+  if (lidar_used) {
     assembleSceneFromOptimizedPosesLidar();
   } else {
     assembleSceneFromOptimizedPoses();
@@ -1287,7 +1285,7 @@ std::vector<Object> semantic_mapping(
       }
       iter++;
     }
-  
+
     std::string file_path = std::string(PROJECT_PATH) + "/output/" + timestamp +
                             "/landmarks/" + timestamp + ".yaml";
     YAML::Node node;
@@ -1364,19 +1362,30 @@ int main(int argc, char *argv[])
 
     std::string rtabmap_database_name;
     std::string model_name;
+    bool lidar_used;
     if (argc == 1) {
       return 1;
     } else if (argc == 2) {
       rtabmap_database_name = argv[1];
+      lidar_used = true;
       model_name = "";
     } else if (argc == 3) {
       rtabmap_database_name = argv[1];
-      model_name = argv[2];
+      std::string arg2 = argv[2];
+      std::transform(arg2.begin(), arg2.end(), arg2.begin(), ::tolower);
+      lidar_used = (arg2 == "1" || arg2 == "true");
+      model_name = "";
+    } else if (argc == 4) {
+      rtabmap_database_name = argv[1];
+      std::string arg2 = argv[2];
+      std::transform(arg2.begin(), arg2.end(), arg2.begin(), ::tolower);
+      lidar_used = (arg2 == "1" || arg2 == "true");
+      model_name = argv[3];
     } else {
       return 1;
     }
 
-    DatabaseExporter extractor(rtabmap_database_name, model_name, false);
+    DatabaseExporter extractor(rtabmap_database_name, model_name, lidar_used);
     Result result = extractor.load_rtabmap_db();
 
     std::vector<Object> objects = semantic_mapping(
