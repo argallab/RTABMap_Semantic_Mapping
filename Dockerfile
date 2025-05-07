@@ -18,6 +18,8 @@ RUN apt-get update && apt-get install -y \
     libpcl-dev && \
     rm -rf /var/lib/apt/lists/*
 
+RUN wget https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8m.pt -P /app/models/
+
 RUN git clone https://github.com/introlab/rtabmap.git \
     && cd rtabmap \
     && git switch humble-devel \

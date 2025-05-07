@@ -29,15 +29,23 @@
 #include <pcl/filters/statistical_outlier_removal.h>
 #include <pcl_conversions/pcl_conversions.h>
 
+#include <pcl/sample_consensus/method_types.h>
+#include <pcl/sample_consensus/model_types.h>
+#include <pcl/segmentation/sac_segmentation.h>
+#include <pcl/filters/extract_indices.h>
+
 #include <Python.h>
 #include <pybind11/embed.h>
 #include <pybind11/numpy.h>
+
+#include <unordered_set>
 
 #include <yaml-cpp/yaml.h>
 
 #include <filesystem>
 #include <iostream>
 #include <random>
+#include <cmath>
 
 namespace py = pybind11;
 
@@ -74,7 +82,7 @@ struct BoundingBox {
 
 class DatabaseExporter {
 public:
-  DatabaseExporter(std::string rtabmap_database_name, std::string model_name);
+  DatabaseExporter(std::string rtabmap_database_name, std::string model_name, bool lidar);
   ~DatabaseExporter();
 
   // @brief Convert a numpy array to a cv::Mat
@@ -107,8 +115,7 @@ private:
   // @param cloud The point cloud
   // @return The filtered point cloud
   // @return The filtered point cloud
-  pcl::PointCloud<pcl::PointXYZRGB>::Ptr
-  filter_point_cloud(pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud);
+  pcl::PointCloud<pcl::PointXYZRGB>::Ptr filter_point_cloud(pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud);
 
   // @brief Project the point cloud onto the camera image, and keep track of
   // which points are in each image
@@ -129,6 +136,15 @@ private:
   nav_msgs::msg::OccupancyGrid::SharedPtr
   point_cloud_to_occupancy_grid(pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud);
 
+  bool initialize_rtabmap_database();
+  void assembleSceneFromOptimizedPosesLidar();
+  void assembleSceneFromOptimizedPoses();
+  void projectAndColorizePointCloud();
+  void assemble_colored_point_cloud();
+  void finalize_and_return_result(Result& result);
+
+  void RANSAC();
+
   // @brief Generate a timestamp string
   // @return The timestamp string in the format %Y-%m-%d_%H-%M-%S
   std::string generate_timestamp_string();
@@ -138,6 +154,7 @@ private:
 
   std::string rtabmap_database_path_;
   std::string model_path_;
+  bool lidar_used;
   std::string timestamp_;
   std::vector<cv::Mat> images_;
   std::vector<std::vector<rtabmap::CameraModel>> camera_models_;
@@ -154,4 +171,28 @@ private:
   std::random_device rd_;
   std::mt19937 gen_;
   std::uniform_int_distribution<> dis_;
+
+  std::map<int, rtabmap::Signature> nodes;
+  std::map<int, rtabmap::Transform> optimizedPoses;
+  std::multimap<int, rtabmap::Link> links;
+
+  pcl::PointCloud<pcl::PointXYZRGB>::Ptr assembledCloud{new pcl::PointCloud<pcl::PointXYZRGB>};
+  pcl::PointCloud<pcl::PointXYZI>::Ptr assembledCloudI{new pcl::PointCloud<pcl::PointXYZI>};
+
+  std::map<int, rtabmap::Transform> robotPoses;
+  std::vector<std::map<int, rtabmap::Transform>> cameraPoses;
+  std::map<int, rtabmap::Transform> scanPoses;
+
+  std::map<int, double> cameraStamps;
+  std::map<int, std::vector<rtabmap::CameraModel>> cameraModels;
+  std::map<int, cv::Mat> cameraDepths;
+
+  std::vector<int> rawViewpointIndices;
+  std::map<int, rtabmap::Transform> rawViewpoints;
+  std::map<int, cv::Mat> rgb_images;
+
+  pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr cloudToExport{new pcl::PointCloud<pcl::PointXYZRGBNormal>};
+  pcl::PointCloud<pcl::PointXYZINormal>::Ptr cloudIToExport{new pcl::PointCloud<pcl::PointXYZINormal>};
+    
+  std::vector<std::pair<std::pair<int, int>, pcl::PointXY>> pointToPixel;
 };
