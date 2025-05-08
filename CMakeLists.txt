@@ -32,7 +32,11 @@ find_package(Python3 COMPONENTS Development Interpreter REQUIRED)
 find_package(rclcpp REQUIRED)
 
 add_executable(database_exporter
+    src/main.cpp
+    src/lidar_database_exporter.cpp
+    src/wc_database_exporter.cpp
     src/database_exporter.cpp
+    src/semantic_mapping.cpp
 )
 
 include_directories(

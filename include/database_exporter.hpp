@@ -1,3 +1,6 @@
+#ifndef DATABASE_EXPORTER_H
+#define DATABASE_EXPORTER_H
+
 #include <rtabmap/core/DBDriver.h>
 #include <rtabmap/core/Parameters.h>
 #include <rtabmap/core/ProgressState.h>
@@ -20,19 +23,19 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 
 #include "pcl/io/pcd_io.h"
-#include <pcl/impl/point_types.hpp>
-#include <pcl/point_cloud.h>
 #include <pcl/cloud_iterator.h>
 #include <pcl/common/centroid.h>
 #include <pcl/filters/passthrough.h>
 #include <pcl/filters/radius_outlier_removal.h>
 #include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/impl/point_types.hpp>
+#include <pcl/point_cloud.h>
 #include <pcl_conversions/pcl_conversions.h>
 
+#include <pcl/filters/extract_indices.h>
 #include <pcl/sample_consensus/method_types.h>
 #include <pcl/sample_consensus/model_types.h>
 #include <pcl/segmentation/sac_segmentation.h>
-#include <pcl/filters/extract_indices.h>
 
 #include <Python.h>
 #include <pybind11/embed.h>
@@ -42,20 +45,20 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <cmath>
 #include <filesystem>
 #include <iostream>
 #include <random>
-#include <cmath>
 
-namespace py = pybind11;
+  namespace py = pybind11;
 
 struct MouseData {
-    cv::Mat image;
-    cv::Point start_point;
-    cv::Point end_point;
-    cv::Rect bounding_box;
-    bool drawing = false;
-    bool finished = false;
+  cv::Mat image;
+  cv::Point start_point;
+  cv::Point end_point;
+  cv::Rect bounding_box;
+  bool drawing = false;
+  bool finished = false;
 };
 
 struct Object {
@@ -70,20 +73,21 @@ struct Result {
   std::string timestamp = "";
   pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud;
   std::vector<std::tuple<cv::Mat, cv::Mat, rtabmap::Transform,
-                       std::map<std::pair<int, int>, int>>>
-      mapping_data;
+                         std::map<std::pair<int, int>, int>>>
+    mapping_data;
 };
 
 struct BoundingBox {
   int x1, y1, x2, y2;
-  BoundingBox(int x1, int y1, int x2, int y2)
-      : x1(x1), y1(y1), x2(x2), y2(y2) {}
+  BoundingBox(int x1, int y1, int x2, int y2) : x1(x1), y1(y1), x2(x2), y2(y2)
+  {
+  }
 };
 
 class DatabaseExporter {
 public:
-  DatabaseExporter(std::string rtabmap_database_name, std::string model_name, bool lidar);
-  ~DatabaseExporter();
+  DatabaseExporter(std::string rtabmap_database_name, std::string model_name);
+  virtual ~DatabaseExporter();
 
   // @brief Convert a numpy array to a cv::Mat
   // @param np_array The numpy array
@@ -95,76 +99,37 @@ public:
   // @return The numpy array
   py::array mat_to_numpy(const cv::Mat &mat);
 
-  // @brief Calculate the centroid of a 3D pointcloud
-  // @param cloud The pointcloud
-  // @return The centroid
-  pcl::PointXYZ
-  calculate_centroid(pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud);
-
   // @brief Load the rtabmap database
   // @return The result of the operation
   Result load_rtabmap_db();
 
-  // @brief Get the detections from the neural network
-  // @param net The neural network
-  // @return The detections
-  void get_detections(py::object &net);
+  virtual bool initialize_rtabmap_database() = 0;
+  virtual void assembleSceneFromOptimizedPoses() = 0;
+  virtual void projectAndColorizePointCloud() = 0;
+  virtual void assemble_colored_point_cloud() = 0;
+  virtual void finalize_and_return_result(Result &result) = 0;
 
-private:
-  // @brief Filter the point cloud using statistical and radius outlier removal
-  // @param cloud The point cloud
-  // @return The filtered point cloud
-  // @return The filtered point cloud
-  pcl::PointCloud<pcl::PointXYZRGB>::Ptr filter_point_cloud(pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud);
-
-  // @brief Project the point cloud onto the camera image, and keep track of
-  // which points are in each image
-  // @param image_size The size of the image
-  // @param camera_matrix The camera matrix
-  // @param cloud The point cloud
-  // @param camera_transform The transform of the camera
-  // @return The input image overlayed with the point cloud projection
-  std::pair<cv::Mat, std::map<std::pair<int, int>, int>>
-  project_cloud_to_camera(const cv::Size &image_size,
-                          const cv::Mat &camera_matrix,
-                          const pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud,
-                          const rtabmap::Transform &camera_transform);
-
-  // @brief Convert a point cloud to an occupancy grid
-  // @param cloud The point cloud
-  // @return The occupancy grid
-  nav_msgs::msg::OccupancyGrid::SharedPtr
-  point_cloud_to_occupancy_grid(pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud);
-
-  bool initialize_rtabmap_database();
-  void assembleSceneFromOptimizedPosesLidar();
-  void assembleSceneFromOptimizedPoses();
-  void projectAndColorizePointCloud();
-  void assemble_colored_point_cloud();
-  void finalize_and_return_result(Result& result);
-
-  void RANSAC();
+  // void RANSAC();
 
   // @brief Generate a timestamp string
   // @return The timestamp string in the format %Y-%m-%d_%H-%M-%S
   std::string generate_timestamp_string();
 
+protected:
   cv::dnn::Net net_;
   nav_msgs::msg::OccupancyGrid::SharedPtr rtabmap_occupancy_grid_;
 
   std::string rtabmap_database_path_;
   std::string model_path_;
-  bool lidar_used;
   std::string timestamp_;
   std::vector<cv::Mat> images_;
   std::vector<std::vector<rtabmap::CameraModel>> camera_models_;
   std::vector<std::vector<rtabmap::StereoCameraModel>> stereo_models_;
 
-  pcl::PointCloud<pcl::PointXYZRGB>::Ptr rtabmap_cloud_;
   // rgb image, depth image, transform from camera to world, pixel to point map
   std::vector<std::tuple<cv::Mat, cv::Mat, rtabmap::Transform,
-                       std::map<std::pair<int, int>, int>>>
-      mapping_data_;
+                         std::map<std::pair<int, int>, int>>>
+    mapping_data_;
 
   bool export_images_;
 
@@ -175,9 +140,6 @@ private:
   std::map<int, rtabmap::Signature> nodes;
   std::map<int, rtabmap::Transform> optimizedPoses;
   std::multimap<int, rtabmap::Link> links;
-
-  pcl::PointCloud<pcl::PointXYZRGB>::Ptr assembledCloud{new pcl::PointCloud<pcl::PointXYZRGB>};
-  pcl::PointCloud<pcl::PointXYZI>::Ptr assembledCloudI{new pcl::PointCloud<pcl::PointXYZI>};
 
   std::map<int, rtabmap::Transform> robotPoses;
   std::vector<std::map<int, rtabmap::Transform>> cameraPoses;
@@ -191,8 +153,7 @@ private:
   std::map<int, rtabmap::Transform> rawViewpoints;
   std::map<int, cv::Mat> rgb_images;
 
-  pcl::PointCloud<pcl::PointXYZRGBNormal>::Ptr cloudToExport{new pcl::PointCloud<pcl::PointXYZRGBNormal>};
-  pcl::PointCloud<pcl::PointXYZINormal>::Ptr cloudIToExport{new pcl::PointCloud<pcl::PointXYZINormal>};
-    
   std::vector<std::pair<std::pair<int, int>, pcl::PointXY>> pointToPixel;
 };
+
+#endif // DATABASE_EXPORTER_H
