@@ -251,18 +251,9 @@ void WCDatabaseExporter::assembleSceneFromOptimizedPoses()
 
     float noiseRadius = 0.0f;
     int noiseMinNeighbors = 5;
-    bool exportImages = false;
-    bool texture = false;
-    cv::Mat tmpDepth;
 
     if (node.getWeight() != -1) {
-      node.sensorData().uncompressData(
-        exportImages ? &rgb : 0,
-        (texture || exportImages) &&
-            !node.sensorData().depthOrRightCompressed().empty()
-          ? &tmpDepth
-          : 0,
-        &scan);
+      node.sensorData().uncompressData(&rgb, &depth, &scan);
     }
 
     // Skip if no camera or no depth
@@ -271,7 +262,7 @@ void WCDatabaseExporter::assembleSceneFromOptimizedPoses()
              iter->first);
     }
     // Store images and calibration
-    // rgb_images[iter->first] = rgb;
+    rgb_images[iter->first] = rgb;
     camera_models_.push_back(models);
 
     // Create point cloud from
@@ -507,68 +498,96 @@ void WCDatabaseExporter::finalize_and_return_result(Result &result)
 
   // RANSAC();
 
-  //   for (std::map<int, std::vector<rtabmap::CameraModel>>::iterator iter =
-  //          cameraModels.begin();
-  //        iter != cameraModels.end(); ++iter) {
+  for (std::map<int, std::vector<rtabmap::CameraModel>>::iterator iter =
+         cameraModels.begin();
+       iter != cameraModels.end(); ++iter) {
 
-  //     std::cout << "Processing node " << iter->first << std::endl;
+    std::cout << "Processing node " << iter->first << std::endl;
 
-  //     // Create an empty frame for a Mono8 image (grayscale)
-  //     cv::Mat frame = cv::Mat::zeros(iter->second.front().imageHeight(),
-  //                                    iter->second.front().imageWidth(),
-  //                                    CV_8UC1);
-  //     cv::Mat depth(iter->second.front().imageHeight(),
-  //                   iter->second.front().imageWidth() * iter->second.size(),
-  //                   CV_32FC1);
-  //     cv::Mat mono_frame = mono_images[iter->first]; // Assuming mono_images
-  //     map
-  //                                                    // stores the Mono8
-  //                                                    images
-  //     std::pair<cv::Mat, std::map<std::pair<int, int>, int>> depth_map;
+    // Create an empty frame for a Mono8 image (grayscale)
+    cv::Mat frame = cv::Mat::zeros(iter->second.front().imageHeight(),
+                                   iter->second.front().imageWidth(), CV_8UC1);
+    cv::Mat depth(iter->second.front().imageHeight(),
+                  iter->second.front().imageWidth() * iter->second.size(),
+                  CV_32FC1);
+    cv::Mat combined_image =
+      rgb_images[iter->first]; // Assuming mono_images map
+    // stores the Mono8 images
+    int width = combined_image.cols / 2;
+    int height = combined_image.rows;
+    cv::Mat left_image = combined_image(cv::Rect(0, 0, width, height)).clone();
+    cv::Mat right_image =
+      combined_image(cv::Rect(width, 0, width, height)).clone();
+    std::pair<cv::Mat, std::map<std::pair<int, int>, int>> depth_map;
 
-  //     // Iterate over each camera model in the node
-  //     for (size_t i = 0; i < iter->second.size(); ++i) {
-  //       depth_map = project_cloud_to_camera(
-  //         iter->second.at(i).imageSize(), iter->second.at(i).K(),
-  //         rtabmap_cloud_, robotPoses.at(iter->first) *
-  //         iter->second.at(i).localTransform());
+    // Iterate over each camera model in the node
+    for (size_t i = 0; i < iter->second.size(); ++i) {
+      cv::Mat mono_frame = (i == 0) ? left_image : right_image;
 
-  //       // Copy the depth values to the depth matrix for this camera
-  //       depth_map.first.copyTo(
-  //         depth(cv::Range::all(),
-  //               cv::Range(i * iter->second.front().imageWidth(),
-  //                         (i + 1) * iter->second.front().imageWidth())));
+      cv::Mat image_rotate;
+      cv::rotate(mono_frame, image_rotate, cv::ROTATE_90_COUNTERCLOCKWISE);
 
-  //       // Iterate over all pixels and visualize the depth by drawing circles
-  //       on
-  //       // the grayscale image
-  //       for (int y = 0; y < depth.rows; ++y) {
-  //         for (int x = 0; x < depth.cols; ++x) {
-  //           if (depth.at<float>(y, x) > 0.0f) { // Valid depth
-  //             // In a grayscale image, use the intensity directly for
-  //             // visualization
-  //             uchar intensity =
-  //               mono_frame.at<uchar>(y, x); // Intensity from the Mono8 image
-  //             // We use intensity as a grayscale color for the circle (white
-  //             on
-  //             // black background)
-  //             cv::circle(frame, cv::Point(x, y), 1, cv::Scalar(intensity),
-  //             -1);
-  //           }
-  //         }
-  //       }
-  //       // Store the mapping data (Mono8 image, frame with depth circles,
-  //       pose,
-  //       // and depth map)
-  //       mapping_data_.push_back(
-  //         {mono_frame, frame, robotPoses.at(iter->first), depth_map.second});
-  //     }
-  //   }
+      cv::Mat color_image;
+      cv::cvtColor(image_rotate, color_image, cv::COLOR_GRAY2BGR);
+
+      cv::Mat lab;
+      cv::cvtColor(color_image, lab, cv::COLOR_BGR2Lab);
+
+      std::vector<cv::Mat> lab_planes(3);
+      cv::split(lab, lab_planes);
+      cv::Mat l_channel = lab_planes[0];
+      cv::Mat a = lab_planes[1];
+      cv::Mat b = lab_planes[2];
+
+      // Apply CLAHE to the L-channel
+      cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
+      cv::Mat cl;
+      clahe->apply(l_channel, cl);
+
+      // Merge the CLAHE enhanced L-channel back with A and B channels
+      cv::Mat limg;
+      cv::merge(std::vector<cv::Mat>{cl, a, b}, limg);
+
+      // Convert the enhanced LAB image back to BGR
+      cv::Mat enhanced_img;
+      cv::cvtColor(limg, enhanced_img, cv::COLOR_Lab2BGR);
+
+      depth_map = project_cloud_to_camera(
+        iter->second.at(i).imageSize(), iter->second.at(i).K(), rtabmap_cloud_,
+        robotPoses.at(iter->first) * iter->second.at(i).localTransform());
+
+      // Copy the depth values to the depth matrix for this camera
+      depth_map.first.copyTo(
+        depth(cv::Range::all(),
+              cv::Range(i * iter->second.front().imageWidth(),
+                        (i + 1) * iter->second.front().imageWidth())));
+
+      // Iterate over all pixels and visualize the depth by drawing circles on
+      // the grayscale image
+      for (int y = 0; y < depth.rows; ++y) {
+        for (int x = 0; x < depth.cols; ++x) {
+          if (depth.at<float>(y, x) > 0.0f) { // Valid depth
+            // In a grayscale image, use the intensity directly for
+            // visualization
+            uchar intensity =
+              enhanced_img.at<uchar>(y, x); // Intensity from the Mono8 image
+            // We use intensity as a grayscale color for the circle (white
+            // on black background)
+            cv::circle(frame, cv::Point(x, y), 1, cv::Scalar(intensity), -1);
+          }
+        }
+      }
+      // Store the mapping data (Mono8 image, frame with depth circles, pose,
+      // and depth map)
+      mapping_data_.push_back(
+        {enhanced_img, frame, robotPoses.at(iter->first), depth_map.second});
+    }
+  }
 
   result.success = true;
   result.timestamp = timestamp_;
   result.cloud = rtabmap_cloud_;
-  //   result.mapping_data = mapping_data_;
+  result.mapping_data = mapping_data_;
 
   std::cout << "Finished loading database" << std::endl;
   std::cout << "Number of images: " << mapping_data_.size() << std::endl;

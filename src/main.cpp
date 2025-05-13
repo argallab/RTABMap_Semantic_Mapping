@@ -45,8 +45,8 @@ int main(int argc, char *argv[])
   
     Result result = extractor->load_rtabmap_db();
 
-    // std::vector<Object> objects = semantic_mapping(
-    //   net, *extractor, result.mapping_data, result.cloud, result.timestamp);
+    std::vector<Object> objects = semantic_mapping(
+      net, *extractor, result.mapping_data, result.cloud, result.timestamp);
 
   } catch (const std::exception &e) {
     std::cerr << "Error: " << e.what() << std::endl;
