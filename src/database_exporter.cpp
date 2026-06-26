@@ -85,31 +85,19 @@ DatabaseExporter::DatabaseExporter(std::string rtabmap_database_name,
     std::cout << "Failed to create detections directory" << std::endl;
     return;
   }
+
+  if (!std::filesystem::create_directory(path + "/cleaned")) {
+    std::cout << "Failed to create cleaned directory" << std::endl;
+    return;
+  }
+
+  if (!std::filesystem::create_directory(path + "/edges")) {
+    std::cout << "Failed to create edges directory" << std::endl;
+    return;
+  }
 }
 
 DatabaseExporter::~DatabaseExporter() {}
-
-// @brief: This function takes in a numpy array and converts it to a cv::Mat
-// object
-// @param np_array: The numpy array to convert
-// @return: The cv::Mat object
-cv::Mat DatabaseExporter::numpy_to_mat(const py::array_t<uint8_t> &np_array)
-{
-  py::buffer_info buf = np_array.request();
-  cv::Mat mat(buf.shape[0], buf.shape[1], CV_8UC3, (uchar *)buf.ptr);
-  return mat;
-}
-
-// @brief: This function takes in a cv::Mat object and converts it to a numpy
-// array
-// @param mat: The cv::Mat object to convert
-// @return: The numpy array
-py::array DatabaseExporter::mat_to_numpy(const cv::Mat &mat)
-{
-  return py::array_t<uint8_t>({mat.rows, mat.cols, mat.channels()},
-                              {mat.step[0], mat.step[1], sizeof(uint8_t)},
-                              mat.data);
-}
 
 // @brief: Generate a string from the current time
 // @return: The string representation of the current time in the format

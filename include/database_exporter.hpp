@@ -36,6 +36,7 @@
 #include <pcl/sample_consensus/method_types.h>
 #include <pcl/sample_consensus/model_types.h>
 #include <pcl/segmentation/sac_segmentation.h>
+#include <pcl/segmentation/organized_multi_plane_segmentation.h>
 
 #include <Python.h>
 #include <pybind11/embed.h>
@@ -50,7 +51,7 @@
 #include <iostream>
 #include <random>
 
-  namespace py = pybind11;
+namespace py = pybind11;
 
 struct MouseData {
   cv::Mat image;
@@ -89,16 +90,6 @@ public:
   DatabaseExporter(std::string rtabmap_database_name, std::string model_name);
   virtual ~DatabaseExporter();
 
-  // @brief Convert a numpy array to a cv::Mat
-  // @param np_array The numpy array
-  // @return The cv::Mat
-  cv::Mat numpy_to_mat(const py::array_t<uint8_t> &np_array);
-
-  // @brief Convert a cv::Mat to a numpy array
-  // @param mat The cv::Mat
-  // @return The numpy array
-  py::array mat_to_numpy(const cv::Mat &mat);
-
   // @brief Load the rtabmap database
   // @return The result of the operation
   Result load_rtabmap_db();
@@ -109,6 +100,22 @@ public:
   virtual void assemble_colored_point_cloud() = 0;
   virtual void finalize_and_return_result(Result &result) = 0;
 
+  virtual void configure_vectorizer(
+    float plane_distance_thresh = 0.02f, int min_inliers = 100,
+    int max_iterations = 1000, float epsilon = 0.1f, int min_cluster_size = 50,
+    int max_cluster_size = 10000, float normal_radius = 0.05f,
+    float curvature_threshold = 0.1f)
+  {
+    (void)plane_distance_thresh;
+    (void)min_inliers;
+    (void)max_iterations;
+    (void)epsilon;
+    (void)min_cluster_size;
+    (void)max_cluster_size;
+    (void)normal_radius;
+    (void)curvature_threshold;
+    // or just leave empty if it's pure virtual (=0)
+  };
   // void RANSAC();
 
   // @brief Generate a timestamp string
@@ -151,6 +158,7 @@ protected:
 
   std::vector<int> rawViewpointIndices;
   std::map<int, rtabmap::Transform> rawViewpoints;
+  std::map<int, cv::Mat> depth_images;
   std::map<int, cv::Mat> rgb_images;
 
   std::vector<std::pair<std::pair<int, int>, pcl::PointXY>> pointToPixel;

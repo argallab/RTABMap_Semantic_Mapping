@@ -3,6 +3,9 @@
 
 #include <database_exporter.hpp>
 
+#include <opencv2/opencv.hpp>
+#include <memory>
+
 class WCDatabaseExporter : public DatabaseExporter {
 public:
   using DatabaseExporter::DatabaseExporter;
@@ -52,6 +55,11 @@ private:
 
   pcl::PointCloud<pcl::PointXYZRGB>::Ptr rtabmap_cloud_{
     new pcl::PointCloud<pcl::PointXYZRGB>};
+
+  void edge_detection();
+  void build_map_from_edges();
+  std::vector<cv::Mat> cleaned_imgs;
+  std::vector<cv::Mat> edge_imgs;
 };
 
 #endif // WC_DATABASE_EXPORTER_HPP

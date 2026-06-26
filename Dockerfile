@@ -34,19 +34,19 @@ RUN git clone https://github.com/introlab/rtabmap.git \
 RUN /bin/bash -c "source /opt/ros/humble/setup.bash \
     && pip install ultralytics"
 
-COPY ./include /app/include
-COPY ./src /app/src
-COPY ./databases /app/databases
-COPY ./models /app/models
-COPY ./CMakeLists.txt /app/CMakeLists.txt
-COPY ./entrypoint.sh /app/entrypoint.sh
+# COPY ./include /app/include
+# COPY ./src /app/src
+# COPY ./databases /app/databases
+# COPY ./models /app/models
+# COPY ./CMakeLists.txt /app/CMakeLists.txt
+# COPY ./entrypoint.sh /app/entrypoint.sh
 
-RUN /bin/bash -c "source /opt/ros/humble/setup.bash \
-    && mkdir build \
-    && cd build \
-    && cmake .. -G 'Ninja' \
-    && ninja"
+# RUN /bin/bash -c "source /opt/ros/humble/setup.bash \
+#     && mkdir build \
+#     && cd build \
+#     && cmake .. -G 'Ninja' \
+#     && ninja"
 
-RUN chmod +x /app/entrypoint.sh
-ENTRYPOINT ["/app/entrypoint.sh"]
-CMD []
+# RUN chmod +x /app/entrypoint.sh
+# ENTRYPOINT ["/app/entrypoint.sh"]
+# CMD []

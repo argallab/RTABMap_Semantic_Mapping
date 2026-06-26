@@ -95,7 +95,8 @@ bool LidarDatabaseExporter::initialize_rtabmap_database()
 }
 
 nav_msgs::msg::OccupancyGrid::SharedPtr
-LidarDatabaseExporter::point_cloud_to_occupancy_grid(pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud)
+LidarDatabaseExporter::point_cloud_to_occupancy_grid(
+  pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud)
 {
   // calculate the centroid
   Eigen::Matrix<float, 4, 1> centroid;
@@ -149,12 +150,8 @@ LidarDatabaseExporter::point_cloud_to_occupancy_grid(pcl::PointCloud<pcl::PointX
   return occupancy_grid;
 }
 
-// @brief : This function takes in a point cloud and a camera transform and
-// projects the point cloud to the camera frame. The sequence of
-// filters was determined by trial and error
-// @param cloud: The point cloud to filter
-// @return The filtered point cloud
-pcl::PointCloud<pcl::PointXYZRGB>::Ptr LidarDatabaseExporter::filter_point_cloud(
+pcl::PointCloud<pcl::PointXYZRGB>::Ptr
+LidarDatabaseExporter::filter_point_cloud(
   pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud)
 {
 
@@ -187,48 +184,103 @@ pcl::PointCloud<pcl::PointXYZRGB>::Ptr LidarDatabaseExporter::filter_point_cloud
     1.0); // increase for more permissive, decrease for less
   sor.filter(*sor_cloud);
 
-  // radius outlier removal
-  pcl::PointCloud<pcl::PointXYZRGB>::Ptr radius_cloud(
-    new pcl::PointCloud<pcl::PointXYZRGB>);
-  pcl::RadiusOutlierRemoval<pcl::PointXYZRGB> radius_outlier;
-  radius_outlier.setInputCloud(sor_cloud);
-  radius_outlier.setRadiusSearch(
-    0.2); // adjust based on spacing in the point cloud
-  radius_outlier.setMinNeighborsInRadius(
-    5); // increase for more aggressive outlier removal
-  radius_outlier.filter(*radius_cloud);
-  radius_cloud->width = radius_cloud->points.size();
-
   // find the lowest point in the pointcloud
   auto min_point_iter =
-    std::min_element(radius_cloud->points.begin(), radius_cloud->points.end(),
+    std::min_element(sor_cloud->points.begin(), sor_cloud->points.end(),
                      [](const pcl::PointXYZRGB &lhs,
                         const pcl::PointXYZRGB &rhs) { return lhs.z < rhs.z; });
   // passthrough filter
   pcl::PointCloud<pcl::PointXYZRGB>::Ptr pass_cloud(
     new pcl::PointCloud<pcl::PointXYZRGB>);
   pcl::PassThrough<pcl::PointXYZRGB> pass;
-  pass.setInputCloud(radius_cloud);
+  pass.setInputCloud(sor_cloud);
   pass.setFilterFieldName("z");
   pass.setFilterLimits(min_point_iter->z +
-                         0.7,    // 0.7 meters, magic number sorry
+                         1.5,    // 0.7 meters, magic number sorry
                        FLT_MAX); // adjust based on the scene
   pass.filter(*pass_cloud);
   pass_cloud->width = pass_cloud->points.size();
 
-  // another radius outlier removal
-  pcl::PointCloud<pcl::PointXYZRGB>::Ptr radius2_cloud(
+  // radius outlier removal
+  pcl::PointCloud<pcl::PointXYZRGB>::Ptr radius_cloud(
     new pcl::PointCloud<pcl::PointXYZRGB>);
-  pcl::RadiusOutlierRemoval<pcl::PointXYZRGB> radius2_outlier;
-  radius2_outlier.setInputCloud(pass_cloud);
-  radius2_outlier.setRadiusSearch(
+  pcl::RadiusOutlierRemoval<pcl::PointXYZRGB> radius_outlier;
+  radius_outlier.setInputCloud(pass_cloud);
+  radius_outlier.setRadiusSearch(
     0.2); // adjust based on spacing in the point cloud
-  radius2_outlier.setMinNeighborsInRadius(
+  radius_outlier.setMinNeighborsInRadius(
     3); // increase for more aggressive outlier removal
-  radius2_outlier.filter(*radius2_cloud);
-  radius2_cloud->width = radius2_cloud->points.size();
+  radius_outlier.filter(*radius_cloud);
+  radius_cloud->width = radius_cloud->points.size();
 
-  return radius2_cloud;
+  pcl::PointCloud<pcl::PointXYZRGB>::Ptr remaining_cloud(
+    new pcl::PointCloud<pcl::PointXYZRGB>(*radius_cloud));
+  pcl::PointIndices::Ptr allInliers(new pcl::PointIndices);
+
+  pcl::SACSegmentation<pcl::PointXYZRGB> seg;
+  pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
+  pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients);
+  pcl::ExtractIndices<pcl::PointXYZRGB> extract;
+
+  seg.setOptimizeCoefficients(true);
+  seg.setModelType(pcl::SACMODEL_PLANE);
+  seg.setMethodType(pcl::SAC_RANSAC);
+  seg.setMaxIterations(1000);
+  seg.setDistanceThreshold(0.02);
+
+  // Keep track of original indices for mapping back to input cloud
+  std::vector<int> remaining_indices;
+  for (unsigned long int i = 0; i < radius_cloud->points.size(); ++i) {
+    remaining_indices.push_back(i);
+  }
+
+  while (remaining_cloud->points.size() > 100) {
+    seg.setInputCloud(remaining_cloud);
+    seg.segment(*inliers, *coefficients);
+
+    if (inliers->indices.size() < 100) {
+      break;
+    }
+
+    // Map local indices back to original cloud indices
+    for (const auto &local_idx : inliers->indices) {
+      allInliers->indices.push_back(remaining_indices[local_idx]);
+    }
+
+    // Remove inliers from remaining cloud and update index mapping
+    extract.setInputCloud(remaining_cloud);
+    extract.setIndices(inliers);
+    extract.setNegative(true);
+
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr temp_cloud(
+      new pcl::PointCloud<pcl::PointXYZRGB>);
+    extract.filter(*temp_cloud);
+
+    // Update index mapping - remove inliers
+    std::vector<int> new_remaining_indices;
+    std::set<int> inlier_set(inliers->indices.begin(), inliers->indices.end());
+
+    for (unsigned long int i = 0; i < remaining_indices.size(); ++i) {
+      if (inlier_set.find(i) == inlier_set.end()) {
+        new_remaining_indices.push_back(remaining_indices[i]);
+      }
+    }
+
+    remaining_cloud = temp_cloud;
+    remaining_indices = new_remaining_indices;
+  }
+
+  // Extract all inliers from original cloud
+  pcl::ExtractIndices<pcl::PointXYZRGB> final_extract;
+  final_extract.setInputCloud(radius_cloud);
+  final_extract.setIndices(allInliers);
+  final_extract.setNegative(false);
+
+  pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloudInliers(
+    new pcl::PointCloud<pcl::PointXYZRGB>);
+  final_extract.filter(*cloudInliers);
+
+  return cloudInliers;
 }
 
 void LidarDatabaseExporter::assembleSceneFromOptimizedPoses()
@@ -375,12 +427,13 @@ void LidarDatabaseExporter::assemble_colored_point_cloud()
 {
   float textureRange = 0.0f;
   float textureAngle = 0.0f;
+  float maxDepthError = 0.0f;
   std::vector<float> textureRoiRatios;
   cv::Mat projMask;
   bool distanceToCamPolicy = false;
   const rtabmap::ProgressState progressState;
   pointToPixel = rtabmap::util3d::projectCloudToCameras(
-    *cloudToExport, robotPoses, cameraModels, textureRange, textureAngle,
+    *cloudToExport, robotPoses, cameraModels, textureRange, textureAngle, maxDepthError,
     textureRoiRatios, projMask, distanceToCamPolicy, &progressState);
 
   std::vector<int> pointToCamId;
@@ -392,8 +445,8 @@ void LidarDatabaseExporter::assemble_colored_point_cloud()
     new pcl::PointCloud<pcl::PointXYZRGBNormal>());
   assembledCloudValidPoints->resize(pointToCamId.size());
 
-  // Figure out what color each point in the pointcloud should be based on pixel
-  // color
+  // Figure out what color each point in the pointcloud should be based on
+  // pixel color
   int imagesDone = 1;
   for (std::map<int, rtabmap::Transform>::iterator iter = robotPoses.begin();
        iter != robotPoses.end(); ++iter) {
@@ -552,7 +605,6 @@ void LidarDatabaseExporter::finalize_and_return_result(Result &result)
   return;
 }
 
-
 // @brief Project a point cloud to a given image frame, and map the index of
 // each point that is visible in the camera frame to the pixel coordinate in
 // the image frame
@@ -581,8 +633,8 @@ LidarDatabaseExporter::project_cloud_to_camera(
   cv::Mat depth_image = cv::Mat::zeros(image_size, CV_32FC1);
   rtabmap::Transform t = camera_transform.inverse();
 
-  // create a map from each pixel coordinate to the index of their point in the
-  // pointcloud
+  // create a map from each pixel coordinate to the index of their point in
+  // the pointcloud
   std::map<std::pair<int, int>, int> pixel_to_point_map;
 
   int count = 0;

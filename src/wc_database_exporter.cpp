@@ -1,5 +1,8 @@
 #include "wc_database_exporter.hpp"
 
+#include "torch/script.h"
+#include "torch/torch.h"
+
 WCDatabaseExporter::~WCDatabaseExporter()
 {
   // base path
@@ -38,6 +41,23 @@ WCDatabaseExporter::~WCDatabaseExporter()
     ++depthImagesExported;
   }
 
+  int cleanedImagesExported = 0;
+  // save cleaned images
+  for (const auto &img : cleaned_imgs) {
+    std::string cleaned_path =
+      path + "/cleaned/" + std::to_string(cleanedImagesExported) + ".jpg";
+    cv::imwrite(cleaned_path, img);
+    ++cleanedImagesExported;
+  }
+
+  int edgeImagesExported = 0;
+  for (const auto &img : edge_imgs) {
+    std::string edge_path =
+      path + "/edges/" + std::to_string(edgeImagesExported) + ".jpg";
+    cv::imwrite(edge_path, img);
+    ++edgeImagesExported;
+  }
+
   // save calibration per image (calibration can change over time, e.g.
   // camera has auto focus)
   for (size_t i = 0; i < camera_models_.size(); i++) {
@@ -55,6 +75,9 @@ WCDatabaseExporter::~WCDatabaseExporter()
   }
   std::cout << "RGB Images exported: " << rgbImagesExported << std::endl;
   std::cout << "Depth Images exported: " << depthImagesExported << std::endl;
+  std::cout << "Cleaned Images exported: " << cleanedImagesExported
+            << std::endl;
+  std::cout << "Edge Images exported: " << edgeImagesExported << std::endl;
 }
 
 nav_msgs::msg::OccupancyGrid::SharedPtr
@@ -262,6 +285,7 @@ void WCDatabaseExporter::assembleSceneFromOptimizedPoses()
              iter->first);
     }
     // Store images and calibration
+    depth_images[iter->first] = depth;
     rgb_images[iter->first] = rgb;
     camera_models_.push_back(models);
 
@@ -365,13 +389,15 @@ void WCDatabaseExporter::assemble_colored_point_cloud()
 {
   float textureRange = 0.0f;
   float textureAngle = 0.0f;
+  float maxDepthError = 0.0f;
   std::vector<float> textureRoiRatios;
   cv::Mat projMask;
   bool distanceToCamPolicy = false;
   const rtabmap::ProgressState progressState;
   pointToPixel = rtabmap::util3d::projectCloudToCameras(
     *cloudIToExport, robotPoses, cameraModels, textureRange, textureAngle,
-    textureRoiRatios, projMask, distanceToCamPolicy, &progressState);
+    maxDepthError, textureRoiRatios, projMask, distanceToCamPolicy,
+    &progressState);
 
   std::vector<int> pointToCamId;
   std::vector<float> pointToCamIntensity;
@@ -395,7 +421,6 @@ void WCDatabaseExporter::assemble_colored_point_cloud()
       nodes.at(nodeID).sensorData().uncompressDataConst(&image, 0);
     }
     if (!image.empty()) {
-      std::cout << "Have image" << std::endl;
       UASSERT(cameraModels.find(nodeID) != cameraModels.end());
       int modelsSize = cameraModels.at(nodeID).size();
       for (size_t i = 0; i < pointToPixel.size(); ++i) {
@@ -505,24 +530,41 @@ void WCDatabaseExporter::finalize_and_return_result(Result &result)
     std::cout << "Processing node " << iter->first << std::endl;
 
     // Create an empty frame for a Mono8 image (grayscale)
+
+    // std::cout << "Number of images for this node: "
+    //           << rgb_images[iter->first].cols << "x"
+    //           << rgb_images[iter->first].rows << std::endl;
     cv::Mat frame = cv::Mat::zeros(iter->second.front().imageHeight(),
                                    iter->second.front().imageWidth(), CV_8UC1);
+    // std::cout << "Created empty frame of size: " << frame.cols << "x"
+    //           << frame.rows << std::endl;
     cv::Mat depth(iter->second.front().imageHeight(),
-                  iter->second.front().imageWidth() * iter->second.size(),
-                  CV_32FC1);
+                  iter->second.front().imageWidth(), CV_32FC1);
+    // std::cout << "Created empty depth of size: " << depth.cols << "x"
+    //           << depth.rows << std::endl;
     cv::Mat combined_image =
       rgb_images[iter->first]; // Assuming mono_images map
     // stores the Mono8 images
+
+    // std::cout << "Combined image size: " << combined_image.cols << "x"
+    //           << combined_image.rows << std::endl;
     int width = combined_image.cols / 2;
     int height = combined_image.rows;
+
+    // std::cout << "Width: " << width << ", Height: " << height << std::endl;
     cv::Mat left_image = combined_image(cv::Rect(0, 0, width, height)).clone();
-    cv::Mat right_image =
-      combined_image(cv::Rect(width, 0, width, height)).clone();
+    cv::Mat right_image = combined_image(cv::Rect(width, 0, width, height)).clone();
     std::pair<cv::Mat, std::map<std::pair<int, int>, int>> depth_map;
 
+    cv::Mat combined_depth = depth_images[iter->first];
+    cv::Mat left_depth = combined_depth(cv::Rect(0, 0, width, height)).clone();
+    cv::Mat right_depth = combined_depth(cv::Rect(width, 0, width, height)).clone();
     // Iterate over each camera model in the node
+    // std::cout << "Number of camera models: " << iter->second.size()
+    //           << std::endl;
     for (size_t i = 0; i < iter->second.size(); ++i) {
       cv::Mat mono_frame = (i == 0) ? left_image : right_image;
+      cv::Mat mono_depth = (i == 0) ? left_depth : right_depth;
 
       cv::Mat image_rotate;
       cv::rotate(mono_frame, image_rotate, cv::ROTATE_90_COUNTERCLOCKWISE);
@@ -552,37 +594,43 @@ void WCDatabaseExporter::finalize_and_return_result(Result &result)
       cv::Mat enhanced_img;
       cv::cvtColor(limg, enhanced_img, cv::COLOR_Lab2BGR);
 
-      depth_map = project_cloud_to_camera(
-        iter->second.at(i).imageSize(), iter->second.at(i).K(), rtabmap_cloud_,
-        robotPoses.at(iter->first) * iter->second.at(i).localTransform());
+      // std::cout << "Size of Image is : " << iter->second.at(i).imageSize()
+      //           << std::endl;
+      std::pair<cv::Mat, std::map<std::pair<int, int>, int>> depth_map =
+        project_cloud_to_camera(
+          cv::Size(640, 360), iter->second.at(i).K(), rtabmap_cloud_,
+          robotPoses.at(iter->first) * iter->second.at(i).localTransform());
 
-      // Copy the depth values to the depth matrix for this camera
-      depth_map.first.copyTo(
-        depth(cv::Range::all(),
-              cv::Range(i * iter->second.front().imageWidth(),
-                        (i + 1) * iter->second.front().imageWidth())));
+      cv::Mat rotated_depth;
+      cv::rotate(depth_map.first, rotated_depth, 0);
 
-      // Iterate over all pixels and visualize the depth by drawing circles on
-      // the grayscale image
-      for (int y = 0; y < depth.rows; ++y) {
-        for (int x = 0; x < depth.cols; ++x) {
-          if (depth.at<float>(y, x) > 0.0f) { // Valid depth
-            // In a grayscale image, use the intensity directly for
-            // visualization
+      // Create a frame for visualization with the same dimensions as rotated
+      // images
+      cv::Mat frame =
+        cv::Mat::zeros(rotated_depth.rows, rotated_depth.cols, CV_8UC1);
+
+      // Iterate over all pixels and visualize the depth by drawing circles
+      for (int y = 0; y < rotated_depth.rows; ++y) {
+        for (int x = 0; x < rotated_depth.cols; ++x) {
+          if (rotated_depth.at<float>(y, x) > 0.0f) { // Valid depth
+            // Use intensity from the enhanced image for visualization
             uchar intensity =
-              enhanced_img.at<uchar>(y, x); // Intensity from the Mono8 image
-            // We use intensity as a grayscale color for the circle (white
-            // on black background)
+              enhanced_img.at<cv::Vec3b>(y, x)[0]; // Use first channel
             cv::circle(frame, cv::Point(x, y), 1, cv::Scalar(intensity), -1);
           }
         }
       }
       // Store the mapping data (Mono8 image, frame with depth circles, pose,
       // and depth map)
+      // mapping_data_.push_back(
+      //   {enhanced_img, frame, robotPoses.at(iter->first), depth_map.second});
       mapping_data_.push_back(
-        {enhanced_img, frame, robotPoses.at(iter->first), depth_map.second});
+        {enhanced_img, mono_depth, robotPoses.at(iter->first), depth_map.second});
     }
   }
+
+  edge_detection();
+  build_map_from_edges();
 
   result.success = true;
   result.timestamp = timestamp_;
@@ -596,6 +644,216 @@ void WCDatabaseExporter::finalize_and_return_result(Result &result)
   std::cout << "Timestamp: " << timestamp_ << std::endl;
 
   return;
+}
+
+void WCDatabaseExporter::edge_detection()
+{
+  // for (auto &data : mapping_data_) {
+  // for each of the two images, perform edge detection
+  // the even images are left camera and the odd are right camera,
+  // can make assumption that if the pose is the same then we don't need to
+  // actually do them at the same time
+  // need to convert to edges and then figure out which points are valid
+  // depth and then create a 2d map from that
+  // }
+  std::string model_path = "/app/nn-model/unet_ir_dot_removal.pt";
+  // std::string input_path = "/app/dataset/camera_dataset/input/01-input.png";
+  // std::string output_path = "/app/sampled_output.png";
+
+  torch::Device device(torch::kCPU);
+
+  torch::jit::script::Module model;
+  try {
+    model = torch::jit::load(model_path);
+    model.to(device);
+    model.eval();
+    std::cout << "Model loaded successfully from " << model_path << "\n";
+  } catch (const c10::Error &e) {
+    std::cerr << "Error loading model: " << e.what() << "\n";
+    return;
+  }
+  int count = 0;
+  for (auto &data : mapping_data_) {
+    std::cout << "Processing image " << count++ << "/" << mapping_data_.size()
+              << "\n";
+    cv::Mat image = std::get<0>(data);
+    cv::Mat depth = std::get<1>(data);
+    rtabmap::Transform pose = std::get<2>(data);
+    std::map<std::pair<int, int>, int> pixel_to_point_map = std::get<3>(data);
+
+    cv::Mat gray;
+    cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+
+    // first rotate the image
+    cv::Mat rotated;
+    cv::rotate(gray, rotated, cv::ROTATE_90_CLOCKWISE);
+
+    // std::cout << "Loaded image: " << image.cols << "x" << image.rows << "\n";
+    cv::Mat img_padded;
+    cv::copyMakeBorder(rotated, img_padded, 4,
+                       4,    // top, bottom padding (4+4=8 pixels)
+                       0, 0, // left, right padding (0)
+                       cv::BORDER_REFLECT);
+
+    // std::cout << "Padded to: " << img_padded.cols << "x" << img_padded.rows
+    //           << "\n";
+
+    // Convert to float [0, 1]
+    img_padded.convertTo(img_padded, CV_32F, 1.0 / 255.0);
+
+    // Convert to torch tensor: [H, W] -> [1, 1, H, W]
+    torch::Tensor tensor =
+      torch::from_blob(img_padded.data, {img_padded.rows, img_padded.cols},
+                       torch::kFloat32)
+        .clone(); // Clone to own the data
+
+    tensor = tensor.unsqueeze(0).unsqueeze(0); // Add batch and channel dims
+    tensor = tensor.to(device);
+
+    // std::cout << "Input tensor shape: " << tensor.sizes() << "\n";
+
+    // Run inference
+    torch::Tensor output;
+    {
+      torch::NoGradGuard no_grad;
+      std::vector<torch::jit::IValue> inputs;
+      inputs.push_back(tensor);
+
+      output = model.forward(inputs).toTensor();
+    }
+
+    // std::cout << "Output tensor shape: " << output.sizes() << "\n";
+
+    // Remove batch and channel dimensions: [1, 1, H, W] -> [H, W]
+    output = output.squeeze(0).squeeze(0);
+
+    // Crop from 368x640 back to 360x640
+    // Slice: output[4:364, :]
+    output = output.slice(0, 4, 364); // dim=0 (height), from index 4 to 364
+
+    // std::cout << "Cropped output shape: " << output.sizes() << "\n";
+
+    // Convert to OpenCV Mat
+    cv::Mat output_img(output.size(0), output.size(1), CV_32F,
+                       output.data_ptr<float>());
+    output_img = output_img.clone(); // Deep copy
+
+    // Convert back to [0, 255] uint8
+    output_img.convertTo(output_img, CV_8U, 255.0);
+
+    cleaned_imgs.push_back(output_img);
+  }
+
+  for (const auto &cleaned : cleaned_imgs) {
+    cv::Mat blurred;
+    cv::GaussianBlur(cleaned, blurred, cv::Size(3, 3), 0);
+
+    cv::Mat edges;
+    cv::Canny(blurred, edges, 50.0, 150.0);
+
+    edge_imgs.push_back(edges);
+  }
+
+  return;
+}
+
+void WCDatabaseExporter::build_map_from_edges()
+{
+  // Map resolution in meters per pixel
+  const float resolution = 0.05f;
+
+  // Accumulate all valid 3D edge points across all images
+  std::vector<Eigen::Vector3f> world_points;
+
+  for (size_t i = 0; i < cleaned_imgs.size(); i++) {
+    auto &data = mapping_data_[i];
+    cv::Mat &edges = edge_imgs[i];
+
+    rtabmap::Transform pose = std::get<2>(data);
+    std::map<std::pair<int, int>, int> &pixel_to_point_map = std::get<3>(data);
+
+    // Convert pose to Eigen matrix
+    Eigen::Matrix4f pose_mat = pose.toEigen4f();
+
+    for (int y = 0; y < edges.rows; y++) {
+      for (int x = 0; x < edges.cols; x++) {
+        if (edges.at<uchar>(y, x) == 0)
+          continue; // not an edge
+
+        // Check if this pixel has valid depth
+        auto key = std::make_pair(x, y);
+        auto it = pixel_to_point_map.find(key);
+        if (it == pixel_to_point_map.end())
+          continue;
+
+        // Get the 3D point from the cloud using the index
+        // pcl::PointXYZ pt = rtabmap_cloud_->points[it->second];
+        pcl::PointXYZRGB pt = rtabmap_cloud_->points[it->second];
+
+        // Transform to world space
+        Eigen::Vector4f p(pt.x, pt.y, pt.z, 1.0f);
+        Eigen::Vector4f world_p = pose_mat * p;
+
+        // Height filter — tune these values to your environment
+        float z = world_p.z();
+        if (z < 0.1f || z > 2.0f)
+          continue;
+
+        world_points.push_back(world_p.head<3>());
+      }
+    }
+  }
+
+  // Find bounds of all points
+  float min_x = std::numeric_limits<float>::max();
+  float min_y = std::numeric_limits<float>::max();
+  float max_x = std::numeric_limits<float>::lowest();
+  float max_y = std::numeric_limits<float>::lowest();
+
+  for (const auto &p : world_points) {
+    min_x = std::min(min_x, p.x());
+    min_y = std::min(min_y, p.y());
+    max_x = std::max(max_x, p.x());
+    max_y = std::max(max_y, p.y());
+  }
+
+  // Add some padding
+  min_x -= 1.0f;
+  min_y -= 1.0f;
+  max_x += 1.0f;
+  max_y += 1.0f;
+
+  int grid_w = static_cast<int>((max_x - min_x) / resolution) + 1;
+  int grid_h = static_cast<int>((max_y - min_y) / resolution) + 1;
+
+  // Start with all unknown (205)
+  cv::Mat grid(grid_h, grid_w, CV_8U, cv::Scalar(205));
+
+  // Mark occupied cells
+  for (const auto &p : world_points) {
+    int gx = static_cast<int>((p.x() - min_x) / resolution);
+    int gy = static_cast<int>((p.y() - min_y) / resolution);
+    if (gx >= 0 && gx < grid_w && gy >= 0 && gy < grid_h) {
+      grid.at<uchar>(gy, gx) = 0; // occupied
+    }
+  }
+
+  // Save as PGM
+  cv::imwrite("/app/map.pgm", grid);
+
+  // Also save a YAML file so ROS map_server can load it
+  std::ofstream yaml("/app/map.yaml");
+  yaml << "image: map.pgm\n";
+  yaml << "resolution: " << resolution << "\n";
+  yaml << "origin: [" << min_x << ", " << min_y << ", 0.0]\n";
+  yaml << "negate: 0\n";
+  yaml << "occupied_thresh: 0.65\n";
+  yaml << "free_thresh: 0.196\n";
+  yaml.close();
+
+  std::cout << "Map saved: " << grid_w << "x" << grid_h << " pixels at "
+            << resolution << "m/px\n";
+  std::cout << "Total edge points projected: " << world_points.size() << "\n";
 }
 
 // @brief Project a point cloud to a given image frame, and map the index of

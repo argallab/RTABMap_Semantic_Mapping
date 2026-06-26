@@ -3,8 +3,14 @@
 
 #include <database_exporter.hpp>
 #include <lidar_database_exporter.hpp>
+#include <pybind11/iostream.h>
 
 class LidarDatabaseExporter;
+
+// @brief Convert a cv::Mat to a numpy array
+// @param mat The cv::Mat
+// @return The numpy array
+py::array mat_to_numpy(const cv::Mat &mat);
 
 // @brief: Calculate the centroid of a given point cloud
 // @param cloud: The point cloud to calculate the centroid of
@@ -19,10 +25,9 @@ pcl::PointXYZ calculate_centroid(pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud);
 // @param cloud: The point cloud
 // @param pose: The pose of the camera in the world frame
 pcl::PointCloud<pcl::PointXYZRGB>::Ptr object_cloud_from_bounding_box(
-    std::tuple<std::string, float, BoundingBox> bounding_box,
-    std::map<std::pair<int, int>, int> pixel_to_point_map,
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr &cloud,
-    rtabmap::Transform pose);
+  std::tuple<std::string, float, BoundingBox> bounding_box,
+  std::map<std::pair<int, int>, int> pixel_to_point_map,
+  pcl::PointCloud<pcl::PointXYZRGB>::Ptr &cloud, rtabmap::Transform pose);
 
 // @brief: Perform semantic mapping on a given point cloud using a given neural
 // network
@@ -36,12 +41,9 @@ pcl::PointCloud<pcl::PointXYZRGB>::Ptr object_cloud_from_bounding_box(
 // closest point to the camera, the label of the object, and the confidence of
 // the label
 std::vector<Object> semantic_mapping(
-    py::object &net,
-    DatabaseExporter &exporter, // this needs to eventually be overloaded 
-    std::vector<std::tuple<cv::Mat, cv::Mat, rtabmap::Transform,
+  py::object &net,
+  std::vector<std::tuple<cv::Mat, cv::Mat, rtabmap::Transform,
                          std::map<std::pair<int, int>, int>>> &mapping_data,
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr &cloud,
-    std::string &timestamp);
-
+  pcl::PointCloud<pcl::PointXYZRGB>::Ptr &cloud, std::string &timestamp);
 
 #endif // SEMANTIC_MAPPING_HPP

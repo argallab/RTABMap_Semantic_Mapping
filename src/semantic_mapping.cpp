@@ -1,5 +1,16 @@
 #include "semantic_mapping.hpp"
 
+// @brief: This function takes in a cv::Mat object and converts it to a numpy
+// array
+// @param mat: The cv::Mat object to convert
+// @return: The numpy array
+py::array mat_to_numpy(const cv::Mat &mat)
+{
+  return py::array_t<uint8_t>({mat.rows, mat.cols, mat.channels()},
+                              {mat.step[0], mat.step[1], sizeof(uint8_t)},
+                              mat.data);
+}
+
 pcl::PointXYZ calculate_centroid(pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud)
 {
   pcl::PointXYZ centroid;
@@ -97,7 +108,7 @@ pcl::PointCloud<pcl::PointXYZRGB>::Ptr object_cloud_from_bounding_box(
 }
 
 std::vector<Object> semantic_mapping(
-  py::object &net, DatabaseExporter &exporter,
+  py::object &net,
   std::vector<std::tuple<cv::Mat, cv::Mat, rtabmap::Transform,
                          std::map<std::pair<int, int>, int>>> &mapping_data,
   pcl::PointCloud<pcl::PointXYZRGB>::Ptr &cloud, std::string &timestamp)
@@ -113,7 +124,7 @@ std::vector<Object> semantic_mapping(
     cv::Mat depth = std::get<1>(frame);
     rtabmap::Transform pose = std::get<2>(frame);
     std::map<std::pair<int, int>, int> pixel_to_point_map = std::get<3>(frame);
-    py::array np_array = exporter.mat_to_numpy(rgb);
+    py::array np_array = mat_to_numpy(rgb);
     py::list detections = net.attr("predict")(np_array);
 
     std::vector<std::tuple<std::string, float, BoundingBox>> bounding_boxes;
@@ -122,9 +133,11 @@ std::vector<Object> semantic_mapping(
       py::object names = detection.attr("names");
       py::object speed = detection.attr("speed");
       if (!boxes.is_none()) {
+
         auto box_list =
           boxes.attr("xyxy")
             .cast<py::list>(); // Example of accessing box coordinates
+
         for (size_t i = 0; i < py::len(box_list); ++i) {
           py::object box = box_list[i];
           py::object conf_tensor = boxes.attr("conf");
@@ -132,9 +145,11 @@ std::vector<Object> semantic_mapping(
             continue;
           }
 
+          std::cout << "Above 90 confidence" << std::endl;
+
           // Extract the box coordinates
           auto numpy_array =
-            box_list[py::int_(0)].attr("cpu")().attr("numpy")();
+            box_list[py::int_(i)].attr("cpu")().attr("numpy")();
 
           // Access individual elements using NumPy indexing.
           int x1 = numpy_array[py::int_(0)].cast<int>();
@@ -308,3 +323,4 @@ std::vector<Object> semantic_mapping(
   std::cout << "Finished semantic mapping" << std::endl;
   return objects;
 }
+

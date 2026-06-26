@@ -2,6 +2,7 @@
 #define LIDAR_DATABASE_EXPORTER_HPP
 
 #include <database_exporter.hpp>
+#include <rtabmap_vectorize.hpp>
 
 class LidarDatabaseExporter : public DatabaseExporter {
 public:
@@ -19,7 +20,8 @@ private:
   nav_msgs::msg::OccupancyGrid::SharedPtr
   point_cloud_to_occupancy_grid(pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud);
 
-  // @brief Filter the point cloud using statistical and radius outlier removal
+  // @brief Filter the point cloud using statistical and radius outlier
+  // removal
   // @param cloud The point cloud
   // @return The filtered point cloud
   pcl::PointCloud<pcl::PointXYZRGB>::Ptr
@@ -50,6 +52,9 @@ private:
 
   pcl::PointCloud<pcl::PointXYZRGB>::Ptr rtabmap_cloud_{
     new pcl::PointCloud<pcl::PointXYZRGB>};
+
+  RTABMapVectorizer vectorizer_;
+  VectorMap vector_map_;
 };
 
 #endif // LIDAR_DATABASE_EXPORTER_HPP

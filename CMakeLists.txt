@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.15...3.29)
+cmake_minimum_required(VERSION 3.22)
 project(rtabmap_database_export)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -30,6 +30,12 @@ find_package(OpenCV 4.5.4 REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
 find_package(Python3 COMPONENTS Development Interpreter REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(PkgConfig REQUIRED)
+# set(CMAKE_PREFIX_PATH "/app/libtorch-cuda12.2")
+find_package(Torch REQUIRED)
+find_package(CGAL REQUIRED) 
+
+pkg_check_modules(JSONCPP jsoncpp)
 
 add_executable(database_exporter
     src/main.cpp
@@ -37,7 +43,14 @@ add_executable(database_exporter
     src/wc_database_exporter.cpp
     src/database_exporter.cpp
     src/semantic_mapping.cpp
+    src/rtabmap_vectorize.cpp
 )
+
+# add_executable(vectorize_test
+#     src/vectorize_test.cpp
+#     src/rtabmap_vectorize.cpp
+#     src/graph_vectorize.cpp
+# )
 
 include_directories(
     include
@@ -46,15 +59,29 @@ include_directories(
     ${RTABMap_INCLUDE_DIRS}
     ${nav2_map_server_INCLUDE_DIRS}
     ${Python3_INCLUDE_DIRS}
+    ${OpenCV_INCLUDE_DIRS}
 )
 
 target_link_libraries(database_exporter PUBLIC
     ${PCL_LIBRARIES}
-    ${opencv_LIBRARIES}
+    ${OpenCV_LIBRARIES}
     ${pcl_conversions_LIBRARIES}
     ${nav2_map_server_LIBRARIES}
-    rtabmap::rtabmap)
+    ${JSONCPP_LIBRARIES}
+    rtabmap::rtabmap
+    torch
+    )
 
-install(TARGETS database_exporter
+# target_link_libraries(vectorize_test PUBLIC
+#     ${PCL_LIBRARIES}
+#     ${OpenCV_LIBRARIES}
+#     ${pcl_conversions_LIBRARIES}
+#     CGAL::CGAL
+#     rtabmap::rtabmap)
+
+install(TARGETS database_exporter 
     DESTINATION ${CMAKE_BINARY_DIR}/lib
 )
+
+
+
