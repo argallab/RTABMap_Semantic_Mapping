@@ -33,24 +33,13 @@ find_package(rclcpp REQUIRED)
 find_package(PkgConfig REQUIRED)
 # set(CMAKE_PREFIX_PATH "/app/libtorch-cuda12.2")
 find_package(Torch REQUIRED)
-find_package(CGAL REQUIRED) 
-
-pkg_check_modules(JSONCPP jsoncpp)
 
 add_executable(database_exporter
     src/main.cpp
-    src/lidar_database_exporter.cpp
     src/wc_database_exporter.cpp
     src/database_exporter.cpp
     src/semantic_mapping.cpp
-    src/rtabmap_vectorize.cpp
 )
-
-# add_executable(vectorize_test
-#     src/vectorize_test.cpp
-#     src/rtabmap_vectorize.cpp
-#     src/graph_vectorize.cpp
-# )
 
 include_directories(
     include
@@ -67,17 +56,9 @@ target_link_libraries(database_exporter PUBLIC
     ${OpenCV_LIBRARIES}
     ${pcl_conversions_LIBRARIES}
     ${nav2_map_server_LIBRARIES}
-    ${JSONCPP_LIBRARIES}
     rtabmap::rtabmap
     torch
     )
-
-# target_link_libraries(vectorize_test PUBLIC
-#     ${PCL_LIBRARIES}
-#     ${OpenCV_LIBRARIES}
-#     ${pcl_conversions_LIBRARIES}
-#     CGAL::CGAL
-#     rtabmap::rtabmap)
 
 install(TARGETS database_exporter 
     DESTINATION ${CMAKE_BINARY_DIR}/lib

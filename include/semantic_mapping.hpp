@@ -2,10 +2,7 @@
 #define SEMANTIC_MAPPING_HPP
 
 #include <database_exporter.hpp>
-#include <lidar_database_exporter.hpp>
 #include <pybind11/iostream.h>
-
-class LidarDatabaseExporter;
 
 // @brief Convert a cv::Mat to a numpy array
 // @param mat The cv::Mat
