@@ -4,5 +4,7 @@ env
 rtabmap_database_export.egg-info
 
 .vscode/
-nn-model/
 dataset/
+nn-model/*.pt
+nn-model/*.pth
+nn-model/validation_samples/
