@@ -30,6 +30,10 @@ find_package(OpenCV 4.5.4 REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
 find_package(Python3 COMPONENTS Development Interpreter REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rosbag2_cpp REQUIRED)
+find_package(rosbag2_storage REQUIRED)
+find_package(tf2_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(PkgConfig REQUIRED)
 # set(CMAKE_PREFIX_PATH "/app/libtorch-cuda12.2")
 find_package(Torch REQUIRED)
@@ -49,6 +53,11 @@ include_directories(
     ${nav2_map_server_INCLUDE_DIRS}
     ${Python3_INCLUDE_DIRS}
     ${OpenCV_INCLUDE_DIRS}
+    ${rclcpp_INCLUDE_DIRS}
+    ${rosbag2_cpp_INCLUDE_DIRS}
+    ${rosbag2_storage_INCLUDE_DIRS}
+    ${tf2_msgs_INCLUDE_DIRS}
+    ${geometry_msgs_INCLUDE_DIRS}
 )
 
 target_link_libraries(database_exporter PUBLIC
@@ -58,6 +67,11 @@ target_link_libraries(database_exporter PUBLIC
     ${nav2_map_server_LIBRARIES}
     rtabmap::rtabmap
     torch
+    ${rclcpp_LIBRARIES}
+    ${rosbag2_cpp_LIBRARIES}
+    ${rosbag2_storage_LIBRARIES}
+    tf2_msgs::tf2_msgs__rosidl_typesupport_cpp
+    geometry_msgs::geometry_msgs__rosidl_typesupport_cpp
     )
 
 install(TARGETS database_exporter 

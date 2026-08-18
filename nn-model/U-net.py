@@ -196,14 +196,15 @@ def evaluate(model, dataloader, criterion, device):
 
     with torch.no_grad():
         for imgs_with_dots, imgs_clean in dataloader:
-            imgs_with_dots = imgs_with_dots.to(device)
-            imgs_clean = imgs_clean.to(device)
+            imgs_with_dots = imgs_with_dots.to(device, non_blocking=True)
+            imgs_clean     = imgs_clean.to(device, non_blocking=True)
 
             imgs_with_dots_padded = _pad_input(imgs_with_dots)
 
-            outputs = model(imgs_with_dots_padded)
-            outputs = _crop_output(outputs)
-            loss = criterion(outputs, imgs_clean)
+            with torch.autocast(device_type=device.type):
+                outputs = model(imgs_with_dots_padded)
+                outputs = _crop_output(outputs)
+                loss    = criterion(outputs, imgs_clean)
 
             # Calculate PSNR
             mse = F.mse_loss(outputs, imgs_clean) + 1e-10
@@ -229,8 +230,8 @@ def train():
 
     # Load dataset
     all_with_dots = sorted(
-        glob.glob("/app/dataset/camera_dataset/input/*.png"))
-    all_clean = sorted(glob.glob("/app/dataset/camera_dataset/output/*.png"))
+        glob.glob("/app/dataset/captured_images/input/*.jpg"))
+    all_clean = sorted(glob.glob("/app/dataset/captured_images/output/*.jpg"))
 
     # Split into train/validation
     train_with_dots, val_with_dots, train_clean, val_clean = train_test_split(
@@ -268,10 +269,10 @@ def train():
         # Training
         model.train()
         train_loss = 0
-        for batch_idx, (imgs_with_dots, imgs_clean) in enumerate(train_loader):
+        for imgs_with_dots, imgs_clean in train_loader:
 
-            imgs_with_dots = imgs_with_dots.to(device)
-            imgs_clean = imgs_clean.to(device)
+            imgs_with_dots = imgs_with_dots.to(device, non_blocking=True)
+            imgs_clean     = imgs_clean.to(device, non_blocking=True)
 
             imgs_with_dots_padded = _pad_input(imgs_with_dots)
 
@@ -300,6 +301,10 @@ def train():
         print(f"  Train Loss: {avg_train_loss:.4f}")
         print(f"  Val Loss: {val_loss:.4f}, Val PSNR: {val_psnr:.2f} dB")
         print(f"  LR: {optimizer.param_groups[0]['lr']:.2e}")
+        if device.type == "cuda":
+            alloc  = torch.cuda.memory_allocated(device) / 1024**2
+            peak = torch.cuda.max_memory_allocated(device) / 1024**2
+            print(f"  GPU mem: {alloc:.0f} MB alloc / {peak:.0f} MB peak")
 
         # Save best model
         if val_loss < best_val_loss:
@@ -321,7 +326,7 @@ def train():
                     'weight_decay': 1e-5,
                 },
             }
-            torch.save(checkpoint, "best_unet_ir_dot_removal.pth")
+            torch.save(checkpoint, "best-unet-24.pth")
             patience_counter = 0
             print("  -> New best model saved!")
             should_save_samples = True  # Always save samples for best model
@@ -356,13 +361,13 @@ def train():
             'weight_decay': 1e-5,
         },
     }
-    torch.save(final_checkpoint, "final_unet_ir_dot_removal.pth")
+    torch.save(final_checkpoint, "final-unet-24.pth")
     print("Training completed!")
 
     model.eval()
     example_input = torch.randn(1, 1, 368, 640).to(device)
     scripted_model = torch.jit.script(model)
-    scripted_model.save("unet_ir_dot_removal.pt")
+    scripted_model.save("unet-24.pt")
 
 
 if __name__ == "__main__":
