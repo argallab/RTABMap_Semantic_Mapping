@@ -58,6 +58,7 @@ include_directories(
     ${rosbag2_storage_INCLUDE_DIRS}
     ${tf2_msgs_INCLUDE_DIRS}
     ${geometry_msgs_INCLUDE_DIRS}
+    ${sensor_msgs_INCLUDE_DIRS}
 )
 
 target_link_libraries(database_exporter PUBLIC
@@ -72,6 +73,7 @@ target_link_libraries(database_exporter PUBLIC
     ${rosbag2_storage_LIBRARIES}
     tf2_msgs::tf2_msgs__rosidl_typesupport_cpp
     geometry_msgs::geometry_msgs__rosidl_typesupport_cpp
+    sensor_msgs::sensor_msgs__rosidl_typesupport_cpp
     )
 
 install(TARGETS database_exporter 
