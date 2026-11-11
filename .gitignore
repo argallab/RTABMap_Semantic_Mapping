@@ -8,3 +8,17 @@ dataset/
 nn-model/*.pt
 nn-model/*.pth
 nn-model/validation_samples/
+# stray CMake output from configuring in the repo root (real builds go in build/)
+/CMakeFiles/
+/CMakeCache.txt
+
+# maps/images written to the repo root by runs
+/*.pgm
+/*.yaml
+/*.png
+
+# per-node comparison images
+comparison/
+
+# model weights (too big for GitHub; copy separately)
+nn-model/*/
