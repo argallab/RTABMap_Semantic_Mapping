@@ -1,0 +1,66 @@
+slam_toolbox:
+  ros__parameters:
+    use_sim_time: true   # consume /clock from bag play --clock
+
+    # ── Frames ────────────────────────────────────────────────────────────────
+    # Our bag publishes: odom→base_link (GTSAM poses), base_link→laser (static).
+    # slam_toolbox reads odom→base_link as the odometry estimate, does scan
+    # matching on top, and outputs map→odom corrections.
+    odom_frame:  gtsam_odom
+    base_frame:  base_link
+    map_frame:   map
+    scan_topic:  /scan
+
+    # ── Solver ────────────────────────────────────────────────────────────────
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver:    SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner:   SCHUR_JACOBI
+    ceres_trust_strategy:   LEVENBERG_MARQUARDT
+    ceres_dogleg_type:      TRADITIONAL_DOGLEG
+    ceres_loss_function:    None
+
+    # ── Scan matching ─────────────────────────────────────────────────────────
+    use_scan_matching:      true
+    use_scan_barycenter:    true
+    max_laser_range:        20.0      # metres; clip long rays
+    minimum_travel_distance: 0.1     # don't match stationary scans
+    minimum_travel_heading:  0.05    # rad (~3°)
+
+    scan_buffer_size:                    10
+    scan_buffer_maximum_scan_distance:   10.0
+
+    # Fine / coarse search windows — these matter most for wall quality.
+    # Smaller fine offset = tighter wall locking.
+    fine_search_angle_offset:   0.00349   # ~0.2°
+    coarse_search_angle_offset: 0.349     # ~20°
+    coarse_angle_resolution:    0.0349    # ~2°
+
+    link_match_minimum_response_fine: 0.1
+    distance_variance_penalty:  0.5
+    angle_variance_penalty:     1.0
+    minimum_angle_penalty:      0.9
+    minimum_distance_penalty:   0.5
+    use_response_expansion:     true
+
+    # ── Map ───────────────────────────────────────────────────────────────────
+    resolution:           0.05         # m/cell — match our raytrace grid
+    map_update_interval:  5.0          # seconds between map publishes
+
+    # ── Mode ─────────────────────────────────────────────────────────────────
+    # "mapping" processes every scan; throttle_scans=N processes every Nth scan.
+    # 1985 scans / 5 = ~400 scans — good quality, ~5× faster.
+    mode:           mapping
+    throttle_scans: 5
+
+    # Do NOT let slam_toolbox re-solve loop closures — GTSAM already did the
+    # global optimization.  Enabling loop closure here causes slam_toolbox's
+    # internal pose graph to diverge from the GTSAM solution.
+    do_loop_closing: false
+
+    # ── Misc ─────────────────────────────────────────────────────────────────
+    debug_logging:             false
+    transform_publish_period:  999.0  # publish map→gtsam_odom correction rarely to avoid /tf flooding
+    transform_timeout:         0.2
+    tf_buffer_duration:        3600.0   # hold entire bag; no TF eviction during playback
+    stack_size_to_use:         40000000
+    enable_interactive_mode:   false

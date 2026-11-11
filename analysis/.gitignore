@@ -1,2 +1,5 @@
 cache/
 __pycache__/
+tools/build/
+probe/*_queries.csv
+probe/*_restarts.csv

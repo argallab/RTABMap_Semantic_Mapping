@@ -1,9 +1,23 @@
 #include "wc_database_exporter.hpp"
 
+// Set per executable by CMakeLists.txt (default = frozen pipeline, dev = working copy).
+#ifndef PIPELINE_NAME
+#define PIPELINE_NAME "unknown"
+#endif
+#ifndef PIPELINE_SRC_SHA256
+#define PIPELINE_SRC_SHA256 "unknown"
+#endif
+
+#include <algorithm>
+#include <cctype>
 #include <cstdarg>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <queue>
 #include <set>
+#include <sstream>
 #include <unistd.h>
 #include <rtabmap/core/Optimizer.h>
 #include <rtabmap/core/RegistrationIcp.h>
@@ -11,8 +25,11 @@
 
 #include <rosbag2_cpp/reader.hpp>
 #include <rosbag2_cpp/writer.hpp>
+#include <rosbag2_storage/storage_filter.hpp>
 #include <rosbag2_storage/storage_options.hpp>
 #include <tf2_msgs/msg/tf_message.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
 #include <rclcpp/serialization.hpp>
@@ -165,6 +182,24 @@ void WCDatabaseExporter::report_wall_thickness(const std::string &label,
                                                const std::map<int, rtabmap::Transform> &poses)
 {
   const WallThickness wt = wall_thickness(poses);
+
+  // analysis/: per-stage pose dump for offline evaluation (no effect on the pipeline)
+  {
+    std::string tag = label;
+    tag.erase(tag.find_last_not_of(' ') + 1);
+    std::replace(tag.begin(), tag.end(), ' ', '_');
+    std::ofstream pf(output_path_ + "/poses_" + tag + ".csv");
+    pf << "id,stamp,x,y,z,qx,qy,qz,qw\n";
+    for (const auto &[nid, T] : poses) {
+      if (nid <= 0) continue;
+      auto nit = nodes.find(nid);
+      const Eigen::Quaternionf q = T.getQuaternionf();
+      pf << nid << ',' << std::setprecision(17) << (nit != nodes.end() ? nit->second.getStamp() : 0.0)
+         << std::setprecision(9) << ',' << T.x() << ',' << T.y() << ',' << T.z() << ','
+         << q.x() << ',' << q.y() << ',' << q.z() << ',' << q.w() << '\n';
+    }
+  }
+
   const std::string line = "walls " + label + ": ref(±30) %.1f / local(±150) %.1f / global %.1f mm median"
                            "   p90 %.1f / %.1f / %.1f   (n=%d)";
   printf(("[walls] " + line + "\n").c_str(),
@@ -415,11 +450,25 @@ WCDatabaseExporter::~WCDatabaseExporter() {}
 // ---------------------------------------------------------------------------
 bool WCDatabaseExporter::initialize_rtabmap_database()
 {
+  // Never write into the input DB.  Rtabmap::init() writes its search index
+  // into the DB it opens, and closing with save (the destructor default)
+  // rewrites Admin.opt_poses -- the live session's graph.  Work on a /tmp copy
+  // that is deleted when this function returns; rtabmap_database_path_ stays
+  // the original (bag lookup and metrics use its name).
+  const std::string work_db = "/tmp/database_exporter_" + std::to_string(::getpid()) + ".db";
+  std::filesystem::copy_file(rtabmap_database_path_, work_db,
+                             std::filesystem::copy_options::overwrite_existing);
+  struct RemoveOnExit {
+    std::string p;
+    ~RemoveOnExit() { std::error_code ec; std::filesystem::remove(p, ec); }
+  } remove_work_db{work_db};
+  printf("Working on a copy of the database: %s\n", work_db.c_str());
+
   rtabmap::ParametersMap parameters;
   rtabmap::DBDriver *driver = rtabmap::DBDriver::create();
 
   std::multimap<int, rtabmap::Link> raw_landmark_links;
-  if (driver->openConnection(rtabmap_database_path_)) {
+  if (driver->openConnection(work_db)) {
     parameters = driver->getLastParameters();
     std::multimap<int, rtabmap::Link> all_raw_links;
     driver->getAllLinks(all_raw_links, true, true);
@@ -444,16 +493,72 @@ bool WCDatabaseExporter::initialize_rtabmap_database()
   UTimer timer;
   printf("Loading database: %s\n", rtabmap_database_path_.c_str());
   rtabmap::Rtabmap rtabmap;
-  rtabmap.init(parameters, rtabmap_database_path_);
+  rtabmap.init(parameters, work_db);
   printf("Loaded in %.2f s\n", timer.ticks());
 
   printf("Optimizing map...\n");
   rtabmap.getGraph(optimizedPoses, links, true, true, &nodes, true, true, true, true);
   printf("Optimized: %zu poses (%.2f s)\n", optimizedPoses.size(), timer.ticks());
+  rtabmap.close(false);  // everything needed is in memory now; don't save into the copy either
 
   if (optimizedPoses.empty()) {
     std::cerr << "No optimized poses found\n";
     return false;
+  }
+
+  // ── Odometry turn-scale correction (env WC_ODOM_YAW_SCALE, default 1 = off) ─
+  // Wheel odometry over-rotates by 4.1% on every GT recording (odom/GT turn
+  // ratio 1.041 on 10-07-01, 10-07-03, 10-08-01; distance scale 1.00), i.e. the
+  // configured track width is ~4% small.  Scaling each odometry link's yaw by
+  // 1/1.041 = 0.9606 undoes it offline; the translation is rotated by the
+  // half-step yaw change so the step keeps its mid-step heading.  The graph
+  // re-solve below then starts from these corrected links.
+  double odom_yaw_scale = 1.0;
+  if (const char *e = std::getenv("WC_ODOM_YAW_SCALE")) odom_yaw_scale = std::atof(e);
+  if (odom_yaw_scale != 1.0) {
+    int n_scaled = 0;
+    for (auto &kv : links) {
+      rtabmap::Link &lk = kv.second;
+      if (lk.type() != rtabmap::Link::kNeighbor && lk.type() != rtabmap::Link::kNeighborMerged) continue;
+      float x, y, z, roll, pitch, yaw;
+      lk.transform().getTranslationAndEulerAngles(x, y, z, roll, pitch, yaw);
+      const float dyaw = (float)((odom_yaw_scale - 1.0) * yaw);
+      const float c = std::cos(0.5f * dyaw), s = std::sin(0.5f * dyaw);
+      lk.setTransform(rtabmap::Transform(c * x - s * y, s * x + c * y, z, roll, pitch, yaw + dyaw));
+      ++n_scaled;
+    }
+    printf("[odom] scaled yaw of %d odometry links by %.4f\n", n_scaled, odom_yaw_scale);
+    add_metric("odom yaw scale: %.4f applied to %d neighbour links (WC_ODOM_YAW_SCALE)", odom_yaw_scale, n_scaled);
+  } else {
+    add_metric("odom yaw scale: 1.0 (off)");
+  }
+
+  // ── Tag-link weights, used by this graph stage AND the tag GTSAM passes ─
+  // The live DB weights over-constrain the tags, and tag orientation is much
+  // noisier than tag position, so: σ ≈ 45 cm per observation, orientation
+  // effectively ignored (position-only landmarks).
+  // Previous tag-GTSAM values: lin 0.02 / ang 0.05; before that 0.005.
+  constexpr double landmark_var_linear  = 0.2;
+  constexpr double landmark_var_angular = 999.0;
+
+  // Re-solve RTAB-Map's graph with every stored landmark link reweighted,
+  // starting from RTAB-Map's own solution (odometry links keep DB weights).
+  {
+    cv::Mat lm_inf = cv::Mat::zeros(6, 6, CV_64FC1);
+    lm_inf.at<double>(0,0) = lm_inf.at<double>(1,1) = lm_inf.at<double>(2,2) = 1.0 / landmark_var_linear;
+    lm_inf.at<double>(3,3) = lm_inf.at<double>(4,4) = lm_inf.at<double>(5,5) = 1.0 / landmark_var_angular;
+    int n_lm = 0;
+    for (auto &kv : links)
+      if (kv.second.type() == rtabmap::Link::kLandmark) { kv.second.setInfMatrix(lm_inf); ++n_lm; }
+    rtabmap::Optimizer *opt = rtabmap::Optimizer::create(parameters);
+    cv::Mat cov;
+    std::map<int, rtabmap::Transform> g =
+        opt->optimize(optimizedPoses.lower_bound(1)->first, optimizedPoses, links, cov);
+    delete opt;
+    if (!g.empty()) optimizedPoses = g;
+    else std::cerr << "[graph] landmark-reweighted re-optimization failed, keeping RTAB-Map's poses\n";
+    add_metric("graph stage: %d landmark links reweighted lin=%.3f ang=%.1f, re-opt %s",
+               n_lm, landmark_var_linear, landmark_var_angular, g.empty() ? "FAILED" : "ok");
   }
   rtabmap_graph_poses_ = optimizedPoses;
 
@@ -606,11 +711,14 @@ bool WCDatabaseExporter::initialize_rtabmap_database()
   }
 
   // ── GTSAM 3-pass re-optimization ─────────────────────────────────────
-  constexpr double landmark_var_linear   = 0.02;    // σ ≈ 14 cm per tag observation (was 0.005 / 7 cm)
-  constexpr double landmark_var_angular  = 0.05;
+  // landmark_var_linear / landmark_var_angular: defined at the graph stage above.
   constexpr double prior_var_linear_base = 0.001;   // tighter: prior strength floored at ~3cm
   constexpr double prior_var_angular_base= 0.001;
-  constexpr int    n_reopt_passes        = 3;
+  // 1 pass: at lin 0.2 / ang 999 the graph stage already solves this problem
+  // (pass 1 moves robot nodes 0.0 mm on 09-29-2, 10-07-01, 10-07-03), and passes
+  // 2-3 were no-ops even at 0.02.  Pass 1 is kept because it adds the per-tag
+  // position priors and tag poses that the ICP rounds optimize against.
+  constexpr int    n_reopt_passes        = 1;
   constexpr float  kMaxTagStd            = 0.45f;
   add_metric("gtsam config: landmark_var lin=%.4f ang=%.4f  prior_var base lin=%.4f ang=%.4f  max_tag_std=%.2f",
              landmark_var_linear, landmark_var_angular,
@@ -837,6 +945,258 @@ bool WCDatabaseExporter::initialize_rtabmap_database()
   clean_scans();
   refine_poses_with_local_map_icp(parameters, tag_poses);
 
+  // ── Wall-direction (Manhattan) heading priors ─────────────────────────
+  // A single scan measures its wall directions without any pose (opposite
+  // walls parallel within ~0.5° on 10-08-01).  In a rectilinear building each
+  // scan's walls should line up with the building axes once its heading is
+  // right, so the mismatch e = wrap90(yaw + wall_dir_scan - axis_world) is a
+  // per-node heading-error measurement.  On 10-08-01 it tracks the GT heading
+  // error (r = 0.65 per node, 0.86 smoothed over ~3–6 m); correcting by it cut
+  // the p90 heading error 1.90° -> ~1.4°.  Single-node e is noisy (~1°), so it
+  // goes in as a weak heading-only prior (σ = kMhSigmaDeg) and the odometry
+  // links average it.  This fixes slow heading drift, e.g. the 2.5° slanted
+  // wall / tapering room on 10-08-01.  Disable with env WC_MANHATTAN=0.
+  {
+    bool enabled = true;
+    if (const char *e = std::getenv("WC_MANHATTAN")) enabled = std::atoi(e) != 0;
+    // Per-node e is noisy (~1°); with raw e as targets (σ 3°, first run on
+    // 10-08-01) ATE improved 10% but RPE1m worsened 7% and the slanted E3–I3
+    // wall only went -2.0° -> -1.8°.  So the targets are now a running median
+    // of e over kMhSmooth consecutive measured nodes (~3 m; GT corr 0.86 when
+    // smoothed vs 0.65 raw), which carries only the slow drift, and σ can be
+    // tighter.  Env WC_MANHATTAN_SIGMA / WC_MANHATTAN_SMOOTH override.
+    double kMhSigmaDeg = 2.0;              // per-node heading prior σ
+    int    kMhSmooth   = 31;               // running-median window (measured nodes), 1 = raw
+    if (const char *e = std::getenv("WC_MANHATTAN_SIGMA"))  kMhSigmaDeg = std::atof(e);
+    if (const char *e = std::getenv("WC_MANHATTAN_SMOOTH")) kMhSmooth = std::max(1, std::atoi(e));
+    constexpr double kMhMaxErrDeg = 8.0;   // larger mismatch → not a Manhattan wall view, skip
+    constexpr double kMhMinCoh    = 0.5;   // coherence of the scan's wall directions
+    constexpr int    kMhMinPts    = 500;
+    constexpr float  kMhRes       = 0.025f;
+
+    // Dominant wall direction (rad, mod 90°, in (-45°, 45°]) and coherence of
+    // a 2D point set: gradient directions of a small hit image, circular mean
+    // of 4·phi weighted by gradient magnitude.
+    auto dominant_dir = [](const std::vector<cv::Point2f> &xy, float res, double &coh) -> double {
+      coh = 0.0;
+      if (xy.size() < 10) return 0.0;
+      float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+      for (const auto &p : xy) { x0 = std::min(x0, p.x); y0 = std::min(y0, p.y); x1 = std::max(x1, p.x); y1 = std::max(y1, p.y); }
+      const int W = (int)((x1 - x0) / res) + 5, H = (int)((y1 - y0) / res) + 5;
+      if ((double)W * H > 4e6) return 0.0;
+      cv::Mat img(H, W, CV_32F, cv::Scalar(0));
+      for (const auto &p : xy) img.at<float>((int)((p.y - y0) / res) + 2, (int)((p.x - x0) / res) + 2) += 1.0f;
+      cv::min(img, cv::Scalar(10.0), img);
+      cv::GaussianBlur(img, img, cv::Size(5, 5), 0);
+      cv::Mat gx, gy;
+      cv::Sobel(img, gx, CV_32F, 1, 0, 3);
+      cv::Sobel(img, gy, CV_32F, 0, 1, 3);
+      double s = 0, c = 0, wsum = 0;
+      for (int r = 0; r < H; ++r)
+        for (int k = 0; k < W; ++k) {
+          const double a = gx.at<float>(r, k), b = gy.at<float>(r, k), m = std::hypot(a, b);
+          if (m < 1e-3) continue;
+          const double ph = std::atan2(b, a);
+          s += m * std::sin(4 * ph); c += m * std::cos(4 * ph); wsum += m;
+        }
+      if (wsum <= 0) return 0.0;
+      coh = std::hypot(s, c) / wsum;
+      return 0.25 * std::atan2(s, c);
+    };
+    auto wrap90 = [](double a) { const double q = M_PI / 2; a = std::fmod(a + q / 2, q); if (a < 0) a += q; return a - q / 2; };
+
+    if (!enabled) {
+      add_metric("manhattan heading priors: off (WC_MANHATTAN=0)");
+    } else {
+      // Building axis from all wall-band points at the current poses.
+      std::vector<cv::Point2f> world;
+      for (const auto &[nid, pts] : per_scan_base_) {
+        auto pit = optimizedPoses.find(nid);
+        if (pit == optimizedPoses.end()) continue;
+        const Eigen::Affine3f T = pit->second.toEigen3f();
+        for (size_t k = 0; k < pts.size(); k += 20) {
+          const auto &p = pts[k];
+          if (p.z < 0.10f || p.z > 1.00f) continue;
+          const Eigen::Vector3f w = T * Eigen::Vector3f(p.x, p.y, p.z);
+          world.emplace_back(w.x(), w.y());
+        }
+      }
+      double coh_w = 0.0;
+      const double axis = dominant_dir(world, 0.05f, coh_w);
+
+      // Per-node mismatch → heading prior.
+      // Tag priors (kPosePrior on -tid) were never applied before (DB has
+      // Optimizer/PriorsIgnored=true).  They can't simply be dropped: GTSAM
+      // finds each landmark through a link keyed by its id, and that prior is
+      // the only one.  So keep them but zero their position weight (no pull),
+      // keeping their angular part so landmarks stay set up exactly as before
+      // (tag orientation is decoupled anyway: landmark links have ang var 999).
+      std::multimap<int, rtabmap::Link> mh_links;
+      for (const auto &kv : links) {
+        if (kv.second.type() == rtabmap::Link::kPosePrior && kv.second.from() < 0) {
+          rtabmap::Link lk = kv.second;
+          cv::Mat inf = lk.infMatrix().clone();
+          inf.at<double>(0, 0) = inf.at<double>(1, 1) = inf.at<double>(2, 2) = 1e-6;
+          lk.setInfMatrix(inf);
+          mh_links.insert({kv.first, lk});
+        } else {
+          mh_links.insert(kv);
+        }
+      }
+      std::vector<double> e_before;
+      int n_prior = 0, n_lowcoh = 0, n_far = 0;
+      std::vector<std::pair<int, double>> meas;   // (node id, e) of usable scans, node-ID order
+      std::vector<cv::Point2f> xy;
+      for (const auto &[nid, pts] : per_scan_base_) {
+        auto pit = optimizedPoses.find(nid);
+        if (pit == optimizedPoses.end()) continue;
+        xy.clear();
+        for (const auto &p : pts)
+          if (p.z >= 0.10f && p.z <= 1.00f) xy.emplace_back(p.x, p.y);
+        if ((int)xy.size() < kMhMinPts) continue;
+        double coh = 0.0;
+        const double dir = dominant_dir(xy, kMhRes, coh);
+        if (coh < kMhMinCoh) { ++n_lowcoh; continue; }
+        const rtabmap::Transform &P = pit->second;
+        const double e = wrap90(P.theta() + dir - axis);
+        if (std::abs(e) > kMhMaxErrDeg * M_PI / 180.0) { ++n_far; continue; }
+        e_before.push_back(std::abs(e) * 180.0 / M_PI);
+        meas.push_back({nid, e});
+      }
+      // Smoothed targets: running median of e over kMhSmooth measured nodes
+      // (node-ID order ≈ path order), so each prior carries the slow drift
+      // around it, not its own scan's noise.
+      for (size_t k = 0; k < meas.size(); ++k) {
+        const int h = kMhSmooth / 2;
+        const size_t a = k > (size_t)h ? k - h : 0, b = std::min(meas.size(), k + h + 1);
+        std::vector<double> win;
+        for (size_t j = a; j < b; ++j) win.push_back(meas[j].second);
+        std::nth_element(win.begin(), win.begin() + win.size() / 2, win.end());
+        const double e_s = win[win.size() / 2];
+        const rtabmap::Transform &P = optimizedPoses.at(meas[k].first);
+        cv::Mat inf = cv::Mat::zeros(6, 6, CV_64FC1);
+        inf.at<double>(0, 0) = inf.at<double>(1, 1) = 1.0 / 100.0;      // x, y: σ 10 m (gauge only)
+        inf.at<double>(2, 2) = inf.at<double>(3, 3) = inf.at<double>(4, 4) = 1.0 / 100.0;
+        const double s = kMhSigmaDeg * M_PI / 180.0;
+        inf.at<double>(5, 5) = 1.0 / (s * s);
+        mh_links.insert({meas[k].first, rtabmap::Link(meas[k].first, meas[k].first, rtabmap::Link::kPosePrior,
+                                            rtabmap::Transform(P.x(), P.y(), 0.0f, 0.0f, 0.0f, (float)(P.theta() - e_s)), inf)});
+        ++n_prior;
+      }
+
+      std::set<int> referenced;
+      for (const auto &kv : mh_links) { referenced.insert(kv.second.from()); referenced.insert(kv.second.to()); }
+      std::map<int, rtabmap::Transform> initial;
+      for (const auto &[nid, pose] : optimizedPoses) if (nid > 0 || referenced.count(nid)) initial[nid] = pose;
+      for (const auto &[nid, pose] : tag_poses) if (referenced.count(nid)) initial[nid] = pose;
+
+      rtabmap::ParametersMap opt_params = parameters;
+      opt_params[rtabmap::Parameters::kOptimizerRobust()] = "true";
+      opt_params[rtabmap::Parameters::kOptimizerPriorsIgnored()] = "false";  // DB has true → priors would be dropped
+      rtabmap::Optimizer *opt = rtabmap::Optimizer::create(opt_params);
+      cv::Mat cov;
+      std::map<int, rtabmap::Transform> np = n_prior > 0
+          ? opt->optimize(initial.lower_bound(1)->first, initial, mh_links, cov)
+          : std::map<int, rtabmap::Transform>();
+      delete opt;
+
+      if (np.empty()) {
+        add_metric("manhattan heading priors: %s (kept previous poses)", n_prior ? "re-opt FAILED" : "no usable scans");
+      } else {
+        // Re-anchor: with heading priors on, the optimizer no longer holds the
+        // root, and the whole solution drifted ~8 cm / 1° (10-08-01, 10-12-01).
+        // Move it back rigidly so the first node keeps its pose from before
+        // this stage (= the live map frame).  The ground-truth link is
+        // initial_pose (GT pose at the first node) × inverse(first node pose),
+        // which needs the first node where the live graph had it.
+        {
+          const int root = initial.lower_bound(1)->first;
+          auto before = optimizedPoses.find(root);
+          auto after = np.find(root);
+          if (before != optimizedPoses.end() && after != np.end()) {
+            const rtabmap::Transform A = before->second * after->second.inverse();
+            add_metric("manhattan re-anchor: first node %d held at its previous pose (solution moved back %.1f mm / %.2f deg)",
+                       root, 1000.0 * std::hypot(A.x(), A.y()), A.theta() * 180.0 / M_PI);
+            for (auto &kv : np) kv.second = A * kv.second;
+          }
+        }
+        double sum_t = 0, max_t = 0, sum_r = 0; int n_moved = 0;
+        for (const auto &[nid, pose] : np) {
+          if (nid > 0) {
+            auto pit = optimizedPoses.find(nid);
+            if (pit != optimizedPoses.end()) {
+              const rtabmap::Transform d = pit->second.inverse() * pose;
+              const double dt = std::hypot(d.x(), d.y());
+              sum_t += dt; max_t = std::max(max_t, dt); sum_r += std::abs(d.theta()); ++n_moved;
+            }
+            optimizedPoses[nid] = pose;
+          } else {
+            tag_poses[nid] = pose;
+          }
+        }
+        // Mismatch after, same nodes/criteria (diagnostic only).
+        std::vector<double> e_after;
+        for (const auto &[nid, pts] : per_scan_base_) {
+          auto pit = optimizedPoses.find(nid);
+          if (pit == optimizedPoses.end()) continue;
+          xy.clear();
+          for (const auto &p : pts) if (p.z >= 0.10f && p.z <= 1.00f) xy.emplace_back(p.x, p.y);
+          if ((int)xy.size() < kMhMinPts) continue;
+          double coh = 0.0;
+          const double dir = dominant_dir(xy, kMhRes, coh);
+          if (coh < kMhMinCoh) continue;
+          const double e = wrap90(pit->second.theta() + dir - axis);
+          if (std::abs(e) <= kMhMaxErrDeg * M_PI / 180.0) e_after.push_back(std::abs(e) * 180.0 / M_PI);
+        }
+        auto med = [](std::vector<double> v) { if (v.empty()) return 0.0; std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end()); return v[v.size() / 2]; };
+        printf("[manhattan] axis %.2f deg (coh %.2f): %d heading priors (σ %.1f deg), skipped %d low-coherence, %d >%.0f deg; |e| median %.2f -> %.2f deg; moved mean %.1f mm / %.2f deg, max %.1f mm\n",
+               axis * 180 / M_PI, coh_w, n_prior, kMhSigmaDeg, n_lowcoh, n_far, kMhMaxErrDeg, med(e_before), med(e_after),
+               n_moved ? 1000 * sum_t / n_moved : 0.0, n_moved ? sum_r / n_moved * 180 / M_PI : 0.0, 1000 * max_t);
+        add_metric("manhattan heading priors: axis %.2f deg (coh %.2f)  %d priors σ=%.1f deg, smoothed over %d nodes (skipped %d low-coh, %d >%.0f deg)  wall mismatch |e| median %.2f -> %.2f deg  moved mean %.1f mm / %.2f deg, max %.1f mm",
+                   axis * 180 / M_PI, coh_w, n_prior, kMhSigmaDeg, kMhSmooth, n_lowcoh, n_far, kMhMaxErrDeg, med(e_before), med(e_after),
+                   n_moved ? 1000 * sum_t / n_moved : 0.0, n_moved ? sum_r / n_moved * 180 / M_PI : 0.0, 1000 * max_t);
+        links = mh_links;
+        report_wall_thickness("manhattan", optimizedPoses);   // also dumps poses_manhattan.csv
+      }
+    }
+  }
+
+  // Map origin (env WC_MAP_ORIGIN): first_node (default) re-expresses the
+  // final poses so the first graph node is (0, 0) facing 0° — where
+  // RTAB-Map was started and /ground_truth/initial_pose was saved, so
+  // T_gt<-map = initial_pose (heading-corrected) with no extra term, and the
+  // exported map, ground truth and live localization in this map compare
+  // directly.  odom keeps RTAB-Map's map frame (origin = where odometry
+  // started, before any driving prior to the first node).  Everything after
+  // this point (scans, grid, tag overlay) uses the shifted poses; the final
+  // poses are dumped to poses_final.csv in the grid's frame.  The per-stage
+  // poses_*.csv above stay in RTAB-Map's frame.
+  {
+    const char *mo_env = std::getenv("WC_MAP_ORIGIN");
+    const bool first_node_origin = !(mo_env && std::string(mo_env) == "odom");
+    auto first = optimizedPoses.lower_bound(1);
+    if (first_node_origin && first != optimizedPoses.end()) {
+      const rtabmap::Transform F = first->second;   // copy: the loop below overwrites first->second
+      const rtabmap::Transform A = rtabmap::Transform(F.x(), F.y(), F.theta()).inverse();
+      for (auto &kv : optimizedPoses) kv.second = A * kv.second;
+      for (auto &kv : tag_poses) kv.second = A * kv.second;
+      add_metric("map origin: first node %d (was x %.3f y %.3f yaw %.2f deg in RTAB-Map's map frame; WC_MAP_ORIGIN=odom keeps that frame)",
+                 first->first, F.x(), F.y(), F.theta() * 180.0 / M_PI);
+    } else {
+      add_metric("map origin: RTAB-Map map frame (odometry start; WC_MAP_ORIGIN=odom)");
+    }
+    std::ofstream pf(output_path_ + "/poses_final.csv");
+    pf << "id,stamp,x,y,z,qx,qy,qz,qw\n";
+    for (const auto &[nid, T] : optimizedPoses) {
+      if (nid <= 0) continue;
+      auto nit = nodes.find(nid);
+      const Eigen::Quaternionf q = T.getQuaternionf();
+      pf << nid << ',' << std::setprecision(17) << (nit != nodes.end() ? nit->second.getStamp() : 0.0)
+         << std::setprecision(9) << ',' << T.x() << ',' << T.y() << ',' << T.z() << ','
+         << q.x() << ',' << q.y() << ',' << q.z() << ',' << q.w() << '\n';
+    }
+  }
+
   // Snapshot final poses and tag observations for the grid overlay.
   viz_poses_ = optimizedPoses;
 
@@ -877,6 +1237,70 @@ void WCDatabaseExporter::clean_scans()
   per_scan_base_.clear();
   scan_local_tf_.clear();
 
+  // Scan scale correction (env WC_SCAN_XSCALE / WC_SCAN_YSCALE, default 1 = off).
+  // EXPERIMENTAL — NOT RECOMMENDED.  Single-scan corner angles on 10-08-01
+  // vary as -1.8°·sin(2α) (α = corner orientation in the scan), which looked
+  // like a ~3.3% sideways-vs-forward scale error, and y *= 1/1.033 removes that
+  // pattern.  But it makes multi-scan wall consistency WORSE (global wall
+  // spread with GT poses 30.9 -> 34.3 mm at y 0.968), so the scale hypothesis
+  // is rejected; the cause of the corner pattern is still open.  Kept only for
+  // experiments.  Applied to x/y in base_link before cropping.
+  float scan_xscale = 1.0f, scan_yscale = 1.0f;
+  if (const char *e = std::getenv("WC_SCAN_XSCALE")) scan_xscale = (float)std::atof(e);
+  if (const char *e = std::getenv("WC_SCAN_YSCALE")) scan_yscale = (float)std::atof(e);
+  if (scan_xscale != 1.0f || scan_yscale != 1.0f)
+    printf("[scan] scale correction x %.4f  y %.4f\n", scan_xscale, scan_yscale);
+
+  // Top-of-view edge filter.  Points along the top border of the depth image
+  // are unreliable; seen from a similar spot on several passes they repeat and
+  // survive every persistence test (10-08-01: a false object in I3, all 37 hits
+  // within 9.3 cm of the top edge at 2.2 m).  The edge is measured from this
+  // recording (99.5th-pct height per 10 cm of range, every 4th scan), and
+  // points within kTopEdgeMargin of it beyond kTopEdgeMinR are dropped.
+  // Cost on the user's marked features: 0–7% of their hits.
+  constexpr bool  kTopEdgeFilter = true;
+  constexpr float kTopEdgeMargin = 0.10f;  // m below the edge
+  constexpr float kTopEdgeMinR   = 1.8f;   // m; nearer the edge is inside the band anyway
+  constexpr float kEdgeRBin = 0.10f, kEdgeZBin = 0.01f, kEdgeZ0 = -0.5f;
+  constexpr int   kEdgeNR = 27, kEdgeNZ = 300;
+  std::vector<float> top_edge(kEdgeNR, 1e9f);   // z of the top edge per range bin (1e9 = unknown → no filtering)
+  if (kTopEdgeFilter) {
+    std::vector<std::vector<uint32_t>> hist(kEdgeNR, std::vector<uint32_t>(kEdgeNZ, 0));
+    int k = 0;
+    for (auto iter = optimizedPoses.lower_bound(1); iter != optimizedPoses.end(); ++iter) {
+      if (k++ % 4) continue;
+      auto node_it = nodes.find(iter->first);
+      if (node_it == nodes.end()) continue;
+      rtabmap::LaserScan scan;
+      node_it->second.sensorData().uncompressData(nullptr, nullptr, &scan);
+      if (scan.isEmpty()) continue;
+      auto pts = rtabmap::util3d::laserScanToPointCloud(scan, scan.localTransform());
+      for (const auto &pt : pts->points) {
+        if (!pcl::isFinite(pt)) continue;
+        const float r = std::hypot(pt.x * scan_xscale, pt.y * scan_yscale);
+        const int rb = (int)(r / kEdgeRBin), zb = (int)((pt.z - kEdgeZ0) / kEdgeZBin);
+        if (rb < 0 || rb >= kEdgeNR || zb < 0 || zb >= kEdgeNZ) continue;
+        ++hist[rb][zb];
+      }
+    }
+    for (int rb = 0; rb < kEdgeNR; ++rb) {
+      uint64_t tot = 0;
+      for (uint32_t c : hist[rb]) tot += c;
+      if (tot < 100) continue;
+      uint64_t acc = 0;
+      for (int zb = 0; zb < kEdgeNZ; ++zb) {
+        acc += hist[rb][zb];
+        if (acc >= 0.995 * tot) { top_edge[rb] = kEdgeZ0 + (zb + 1) * kEdgeZBin; break; }
+      }
+    }
+  }
+  auto near_top_edge = [&](float r, float z) {
+    if (!kTopEdgeFilter || r <= kTopEdgeMinR) return false;
+    const int rb = std::min(kEdgeNR - 1, (int)(r / kEdgeRBin));
+    return top_edge[rb] < 1e8f && z > top_edge[rb] - kTopEdgeMargin;
+  };
+  size_t n_top_edge = 0;
+
   int n_scans = 0, n_dropped = 0;
   size_t n_raw = 0, n_cropped = 0, n_kept = 0;
   for (auto iter = optimizedPoses.lower_bound(1); iter != optimizedPoses.end(); ++iter) {
@@ -888,6 +1312,8 @@ void WCDatabaseExporter::clean_scans()
     if (scan.isEmpty()) continue;
 
     auto base_pts = rtabmap::util3d::laserScanToPointCloud(scan, scan.localTransform());
+    if (scan_xscale != 1.0f || scan_yscale != 1.0f)
+      for (auto &pt : base_pts->points) { pt.x *= scan_xscale; pt.y *= scan_yscale; }
     n_raw += base_pts->size();
 
     // 1. Crop.  flat is the same cloud with z=0 for the 2D outlier filter.
@@ -900,6 +1326,7 @@ void WCDatabaseExporter::clean_scans()
       if (pt.z < kZlo || pt.z > kZhi) continue;
       float r = std::hypot(pt.x, pt.y);
       if (r < kRangeMin || r > kRangeMax) continue;
+      if (near_top_edge(r, pt.z)) { ++n_top_edge; continue; }
       cropped->push_back(pt);
       flat->push_back(pcl::PointXYZ(pt.x, pt.y, 0.0f));
     }
@@ -931,6 +1358,14 @@ void WCDatabaseExporter::clean_scans()
              n_scans, n_dropped, n_raw, n_cropped, n_kept,
              n_cropped ? 100.0 * (n_cropped - n_kept) / n_cropped : 0.0,
              kRorRadius, kRorMinNeigh);
+  add_metric("scan scale: x %.4f  y %.4f  (WC_SCAN_XSCALE / WC_SCAN_YSCALE)", scan_xscale, scan_yscale);
+  {
+    const int rb18 = (int)(1.85f / kEdgeRBin), rb22 = (int)(2.25f / kEdgeRBin);
+    add_metric("scan top-edge filter: %s  dropped %zu points (%.2f%% of cropped) within %.2f m of the top of view beyond %.1f m  (edge z @1.85 m %.2f, @2.25 m %.2f)",
+               kTopEdgeFilter ? "on" : "off", n_top_edge,
+               n_cropped + n_top_edge ? 100.0 * n_top_edge / (n_cropped + n_top_edge) : 0.0,
+               kTopEdgeMargin, kTopEdgeMinR, top_edge[rb18] < 1e8f ? top_edge[rb18] : 0.0f, top_edge[rb22] < 1e8f ? top_edge[rb22] : 0.0f);
+  }
   printf("[scan] points: raw=%zu  after crop=%zu  after 2D ROR(r=%.2f,k=%d)=%zu  (%.1f%% removed by ROR)\n",
          n_raw, n_cropped, kRorRadius, kRorMinNeigh, n_kept,
          n_cropped ? 100.0 * (n_cropped - n_kept) / n_cropped : 0.0);
@@ -966,7 +1401,7 @@ void WCDatabaseExporter::refine_poses_with_local_map_icp(
     const rtabmap::ParametersMap &parameters,
     std::map<int, rtabmap::Transform> &tag_poses)
 {
-  constexpr int    kRounds         = 2;
+  constexpr int    kRounds         = 0;
   constexpr float  kQueryStep      = 0.25f;   // m of travel between query nodes
   constexpr float  kQueryYaw       = 0.26f;   // rad (~15°) of turn between query nodes
   constexpr int    kMinQueryPts    = 500;     // skip near-empty query scans
@@ -1374,20 +1809,106 @@ void WCDatabaseExporter::finalize_and_return_result(Result &result)
     return;
   }
 
-  std::string path = std::string(PROJECT_PATH) + "/output/" + timestamp_;
+  std::string path = output_path_;
+  // Grid file name (env WC_GRID_NAME, default = the run timestamp): names
+  // grid/<name>.pgm, .yaml and _tags.png; the run folder keeps its timestamp.
+  std::string grid_name = timestamp_;
+  if (const char *e = std::getenv("WC_GRID_NAME")) {
+    std::string n = e;
+    for (char &ch : n) if (ch == '/' || ch == ' ') ch = '_';
+    if (!n.empty()) grid_name = n;
+  }
+  add_metric("grid name: %s (WC_GRID_NAME)", grid_name.c_str());
 
   constexpr float kRes = 0.025f;
   constexpr float kPad = 1.0f;
 
+  // ── 1. Align walls with the grid axes BEFORE rasterizing ─────────────────
+  // The old step 7 rotated the finished raster (PCA angle, INTER_NEAREST):
+  // walls at an arbitrary angle were staircased once when rasterized and
+  // resampled again by the rotation -> jagged, uneven walls.  Instead, find
+  // the dominant wall direction from the wall-band points and rasterize once
+  // in a frame where walls run along cell rows/columns.  Points stay in world
+  // frame (PCD unchanged); only grid indexing and the overlay are rotated.
+  // Env WC_GRID_ALIGN: 0 (default) = no rotation, the grid stays in the map
+  // frame (the saved YAML origin has no yaw, so a rotated grid does not line
+  // up with the live map frame); 1 = align to the dominant wall direction
+  // before rasterizing; pca = old post-raster PCA rotation (step 7).
+  int kGridAlign = 0;
+  if (const char *e = std::getenv("WC_GRID_ALIGN"))
+    kGridAlign = std::string(e) == "pca" ? 2 : (std::atoi(e) != 0 ? 1 : 0);
+  const bool kAlignBeforeRaster = kGridAlign == 1;
+  double align_rad = 0.0;
+  if (kGridAlign == 0)
+    add_metric("grid alignment: rotated 0.00 deg (off: grid in the map frame; WC_GRID_ALIGN=1 aligns to walls, WC_GRID_ALIGN=pca old PCA rotation)");
+  if (kAlignBeforeRaster) {
+    // Coarse 5 cm wall-band hit image; gradient directions of a wall image
+    // cluster at the wall normals, which repeat every 90 deg in a rectilinear
+    // building -> circular mean of 4*phi gives the dominant direction.
+    float bx0 = 1e9f, bx1 = -1e9f, by0 = 1e9f, by1 = -1e9f;
+    for (const auto &[nid, pts] : per_scan_xyz_)
+      for (size_t k = 0; k < pts.size(); k += 4) {
+        const auto &p = pts[k];
+        if (p.z < 0.10f || p.z > 1.00f) continue;
+        bx0 = std::min(bx0, p.x); bx1 = std::max(bx1, p.x);
+        by0 = std::min(by0, p.y); by1 = std::max(by1, p.y);
+      }
+    constexpr float kA = 0.05f;
+    const int aw = (int)((bx1 - bx0) / kA) + 3, ah = (int)((by1 - by0) / kA) + 3;
+    cv::Mat cnt(ah, aw, CV_32F, cv::Scalar(0));
+    for (const auto &[nid, pts] : per_scan_xyz_)
+      for (size_t k = 0; k < pts.size(); k += 4) {
+        const auto &p = pts[k];
+        if (p.z < 0.10f || p.z > 1.00f) continue;
+        cnt.at<float>((int)((p.y - by0) / kA) + 1, (int)((p.x - bx0) / kA) + 1) += 1.0f;
+      }
+    cv::Mat img, gx, gy;
+    cv::min(cnt, cv::Scalar(20.0), img);  // cap so dense spots don't dominate
+    cv::GaussianBlur(img, img, cv::Size(3, 3), 0);
+    cv::Sobel(img, gx, CV_32F, 1, 0, 3);
+    cv::Sobel(img, gy, CV_32F, 0, 1, 3);
+    double s4 = 0.0, c4 = 0.0;
+    for (int r = 0; r < ah; ++r)
+      for (int c = 0; c < aw; ++c) {
+        const double a = gx.at<float>(r, c), b = gy.at<float>(r, c);
+        const double m = std::hypot(a, b);
+        if (m < 1e-3) continue;
+        const double phi = std::atan2(b, a);
+        s4 += m * std::sin(4.0 * phi);
+        c4 += m * std::cos(4.0 * phi);
+      }
+    align_rad = -0.25 * std::atan2(s4, c4);  // rotate wall normals onto the axes
+    // Landscape: if the aligned map is taller than wide, add a quarter turn
+    // (exact for a coordinate rotation, unlike rotating a raster).
+    {
+      const double ca = std::cos(align_rad), sa = std::sin(align_rad);
+      float ux0 = 1e9f, ux1 = -1e9f, uy0 = 1e9f, uy1 = -1e9f;
+      for (const auto &[nid, pts] : per_scan_xyz_)
+        for (size_t k = 0; k < pts.size(); k += 16) {
+          const auto &p = pts[k];
+          const float u = (float)(ca * p.x - sa * p.y), v = (float)(sa * p.x + ca * p.y);
+          ux0 = std::min(ux0, u); ux1 = std::max(ux1, u); uy0 = std::min(uy0, v); uy1 = std::max(uy1, v);
+        }
+      if (uy1 - uy0 > ux1 - ux0) align_rad -= M_PI / 2.0;
+    }
+    printf("[grid] wall alignment: rotating %.2f deg before rasterizing\n", align_rad * 180.0 / M_PI);
+    add_metric("grid alignment: rotated %.2f deg onto grid axes before rasterizing (dominant wall direction)",
+               align_rad * 180.0 / M_PI);
+  }
+  const float rot_c = (float)std::cos(align_rad), rot_s = (float)std::sin(align_rad);
+  auto rot = [&](float x, float y) { return cv::Point2f(rot_c * x - rot_s * y, rot_s * x + rot_c * y); };
+
   float xmin=1e9f, xmax=-1e9f, ymin=1e9f, ymax=-1e9f;
   for (const auto &[nid, pts] : per_scan_xyz_)
     for (const auto &p : pts) {
-      xmin=std::min(xmin,p.x); xmax=std::max(xmax,p.x);
-      ymin=std::min(ymin,p.y); ymax=std::max(ymax,p.y);
+      const cv::Point2f q = rot(p.x, p.y);
+      xmin=std::min(xmin,q.x); xmax=std::max(xmax,q.x);
+      ymin=std::min(ymin,q.y); ymax=std::max(ymax,q.y);
     }
   for (const auto &[nid, o] : per_scan_origin_) {
-    xmin=std::min(xmin,o.x); xmax=std::max(xmax,o.x);
-    ymin=std::min(ymin,o.y); ymax=std::max(ymax,o.y);
+    const cv::Point2f q = rot(o.x, o.y);
+    xmin=std::min(xmin,q.x); xmax=std::max(xmax,q.x);
+    ymin=std::min(ymin,q.y); ymax=std::max(ymax,q.y);
   }
   xmin -= kPad; ymin -= kPad; xmax += kPad; ymax += kPad;
 
@@ -1396,9 +1917,11 @@ void WCDatabaseExporter::finalize_and_return_result(Result &result)
 
   std::vector<int8_t> grid(gw * gh, -1);
 
+  // World (x, y) -> cell, in the aligned frame.
   auto to_cell = [&](float x, float y, int &cx_, int &cy_) {
-    cx_ = (int)((x - xmin) / kRes);
-    cy_ = (int)((y - ymin) / kRes);
+    const cv::Point2f q = rot(x, y);
+    cx_ = (int)((q.x - xmin) / kRes);
+    cy_ = (int)((q.y - ymin) / kRes);
   };
 
   // Grid mode: 1 = direct projection (every cleaned point marks its cell),
@@ -1442,24 +1965,170 @@ void WCDatabaseExporter::finalize_and_return_result(Result &result)
   constexpr float kLogFreeMiss=  0.15f;  // 13:1 ratio — single-hit cells survive more free rays at 2.5 cm resolution
   constexpr float kLogClamp   =  8.0f;   // prevent saturation
   constexpr float kHitRangeRef=  1.0f;   // m, range at/below which a hit has full weight
+  // Height-aware free space: occupancy is kept in kLayers height layers of
+  // kLayerH over the wall band.  Each free cell along a ray is cleared only in
+  // the layer the ray actually passes through there (height interpolated from
+  // the camera at kSensorZ to the endpoint), and hits go to the layer of their
+  // own height.  A ray over a tabletop or under a chair seat no longer erases
+  // it; rays outside the band (e.g. to the floor) clear nothing.  A cell is
+  // occupied if any layer is, free if some layer is free and none occupied.
+  // kHeightAwareFree = false → one layer, rays at any height clear the whole
+  // 2D path (previous behaviour, identical results).
+  // DISABLED: on 10-07-03 / 10-08-01 it grew occupied area +77% — a cell is
+  // occupied if ANY of 9 layers is, and each layer is cleared only by the few
+  // rays at that height, so wall scatter survives.  Replaced by the height
+  // veto below, which keeps the 2D grid (same wall trimming) and only stops
+  // rays that pass clearly over/under a cell's solidly observed hits.
+  constexpr bool  kHeightAwareFree = false;
+  constexpr float kSensorZ = 0.12f;   // m in base_link; tf_static camera links z 0.107–0.122
+  constexpr float kLayerH  = 0.10f;
+  constexpr int   kLayers  = kHeightAwareFree ? (int)((kWallZhi - kWallZlo) / kLayerH + 0.5f) : 1;
+  // Height veto (furniture protection): a free update is skipped when the
+  // cell has >= kVetoMinW weighted hits and the ray passes more than
+  // kVetoMargin above the highest or below the lowest hit in that cell — the
+  // ray went over a tabletop / under a seat in 3D.  Walls (hits at all
+  // heights) and sparse speckles (little evidence) are cleared as before.
+  constexpr bool  kHeightVeto  = true;
+  constexpr float kVetoMinW    = 2.0f;   // ≈ 2 full-weight hits (≈ 12 hits from 2.5 m)
+  constexpr float kVetoMargin  = 0.05f;  // m
+  // The veto's height range is the 10th–90th percentile of the cell's
+  // wall-band hit heights (2 cm histogram), not min–max.  A ledge at ~0.75 m
+  // jutting 12–15 cm out of most outer walls (10-12-01, user-confirmed) got a
+  // few stray low points from the wall's foot in its cells; min–max then
+  // spanned 0.05–0.80 m, rays under the ledge were never vetoed and the
+  // ledge footprint came out as a hollow free strip.  Percentiles ignore those
+  // strays (Python replica analysis/grid_sim.py, 10-12-01: strip under the C2–D2
+  // ledge filled, +534/-81 occupied cells, rest of the map unchanged).
+  constexpr bool  kVetoPercentile = true;
+  constexpr float kVetoLoPct = 0.10f, kVetoHiPct = 0.90f;
+  constexpr float kVetoZBin  = 0.02f;
+  constexpr int   kVetoNZ    = (int)((kWallZhi - kWallZlo) / kVetoZBin + 0.5f);   // 45 bins
+  // Close-range evidence wins (furniture keep): a cell hit >= kKeepMinHits
+  // times from < kNearR by >= kKeepMinScans different scans stays occupied
+  // whatever the free rays say.  Near points are precise (~4 mm at < 1.3 m),
+  // so they sit on real surfaces; wall scatter comes mostly from far points
+  // and is still trimmed.  The veto alone missed furniture seen mainly from
+  // 1.5–2.5 m (low hit weight) and objects with gaps (chairs, table legs).
+  // Keeps walls the chair drove along close to (e.g. the long E3–I3 wall on
+  // 10-08-01: 4 cells with it, 1 cell with gaps without).  It does not catch
+  // objects seen only from 1.2–2.2 m — the height-span keep below does.
+  constexpr bool  kNearKeep     = true;
+  constexpr float kNearR        = 1.3f;  // m
+  constexpr int   kKeepMinHits  = 8;
+  constexpr int   kKeepMinScans = 3;
+  // Height-span keep (objects at one height): a cell with >= kSpanMinHits
+  // wall-band hits from >= kSpanMinScans scans, all within kSpanMaxDz of
+  // height, stays occupied — tabletops, shelves, low boxes are thin in z and
+  // get cleared by rays skimming just over/under them.  Wall scatter has hits
+  // spread over the whole band (median 0.48 m) and is still trimmed.
+  // Chosen on 10-08-01 against user-marked features (median span 2–10 cm vs
+  // 48 cm for unwanted fringe); these cells are also exempt from the CC filter.
+  constexpr bool  kSpanKeep     = true;
+  constexpr int   kSpanMinHits  = 15;
+  constexpr int   kSpanMinScans = 5;
+  constexpr float kSpanMaxDz    = 0.12f;  // m
+  // ...and seen over >= kSpanMinSeconds between first and last hit: furniture
+  // is seen again on later passes, a person walking by is not.  On 10-08-01 the
+  // user's features span a median 231 s; the shin-height dashes in I5/J5 (a
+  // passer-by) span 2 s.  10 s keeps 88% of feature cells, drops 95% of those.
+  constexpr double kSpanMinSeconds = 10.0;
+  std::vector<uint8_t> feature_keep((size_t)gw * gh, 0);
+  std::vector<float> cell_zlo, cell_hw;   // per-cell hit-height p10 and hit weight (ledge detection, step 7)
   std::vector<float> min_hit_r(gw * gh, 1e9f);  // nearest range that hit each cell (for metrics)
   double sum_w = 0.0;
-  size_t n_hits = 0, n_free_upd = 0, n_free_protected = 0;
+  size_t n_hits = 0, n_free_upd = 0, n_free_protected = 0, n_free_outside = 0, n_free_vetoed = 0;
   {
-    std::vector<float> lo(gw * gh, 0.0f);  // log-odds per cell, init = unknown
+    const size_t N = (size_t)gw * gh;
+    // Pass 1: per-cell hit weight and hit height range (veto), and close-range
+    // hit / scan counts (near keep).
+    std::vector<float> hz_min, hz_max, hw;
+    std::vector<float> veto_lo, veto_hi;   // height range the veto protects (percentiles or min/max)
+    std::vector<uint32_t> zhist;           // per-cell wall-band height histogram (veto percentiles)
+    std::vector<uint16_t> near_hits, near_scans, all_hits, all_scans;
+    std::vector<uint32_t> near_last, all_last;
+    std::vector<double> t_first, t_last;   // first / last time each cell was hit (s)
+    if (kHeightVeto || kNearKeep || kSpanKeep) {
+      hz_min.assign(N, 1e9f); hz_max.assign(N, -1e9f); hw.assign(N, 0.0f);
+      near_hits.assign(N, 0); near_scans.assign(N, 0); near_last.assign(N, 0);
+      all_hits.assign(N, 0); all_scans.assign(N, 0); all_last.assign(N, 0);
+      t_first.assign(N, 1e18); t_last.assign(N, -1e18);
+      if (kHeightVeto && kVetoPercentile) zhist.assign(N * kVetoNZ, 0);
+      uint32_t sno = 0;
+      for (const auto &[nid, pts] : per_scan_xyz_) {
+        auto oit = per_scan_origin_.find(nid);
+        if (oit == per_scan_origin_.end()) continue;
+        ++sno;
+        auto nit = nodes.find(nid);
+        const double stamp = nit != nodes.end() ? nit->second.getStamp() : 0.0;
+        for (const auto &p : pts) {
+          if (p.z < kWallZlo || p.z > kWallZhi) continue;
+          int hcx, hcy;
+          to_cell(p.x, p.y, hcx, hcy);
+          if (hcx < 0 || hcx >= gw || hcy < 0 || hcy >= gh) continue;
+          const float r = std::hypot(p.x - oit->second.x, p.y - oit->second.y);
+          const size_t i = (size_t)hcy * gw + hcx;
+          hw[i] += r > kHitRangeRef ? (kHitRangeRef / r) * (kHitRangeRef / r) : 1.0f;
+          hz_min[i] = std::min(hz_min[i], p.z);
+          hz_max[i] = std::max(hz_max[i], p.z);
+          if (!zhist.empty())
+            ++zhist[i * kVetoNZ + std::min(kVetoNZ - 1, (int)((p.z - kWallZlo) / kVetoZBin))];
+          if (all_hits[i] < 65535) ++all_hits[i];
+          t_first[i] = std::min(t_first[i], stamp);
+          t_last[i]  = std::max(t_last[i], stamp);
+          if (all_last[i] != sno) { all_last[i] = sno; if (all_scans[i] < 65535) ++all_scans[i]; }
+          if (r < kNearR) {
+            if (near_hits[i] < 65535) ++near_hits[i];
+            if (near_last[i] != sno) { near_last[i] = sno; if (near_scans[i] < 65535) ++near_scans[i]; }
+          }
+        }
+      }
+    }
+    if (kHeightVeto) {
+      if (kVetoPercentile) {
+        veto_lo.assign(N, 1e9f); veto_hi.assign(N, -1e9f);
+        for (size_t i = 0; i < N; ++i) {
+          const uint32_t *h = &zhist[i * kVetoNZ];
+          uint64_t tot = 0;
+          for (int b = 0; b < kVetoNZ; ++b) tot += h[b];
+          if (tot == 0) continue;
+          uint64_t acc = 0;
+          bool have_lo = false;
+          for (int b = 0; b < kVetoNZ; ++b) {
+            acc += h[b];
+            if (!have_lo && acc >= kVetoLoPct * tot) { veto_lo[i] = kWallZlo + b * kVetoZBin; have_lo = true; }
+            if (acc >= kVetoHiPct * tot) { veto_hi[i] = kWallZlo + (b + 1) * kVetoZBin; break; }
+          }
+        }
+        std::vector<uint32_t>().swap(zhist);
+      } else {
+        veto_lo = hz_min; veto_hi = hz_max;
+      }
+      cell_zlo = veto_lo;
+    }
+    cell_hw = hw;
+    std::vector<float> lo(N * kLayers, 0.0f);  // log-odds per cell and layer, init = unknown
     // Own-scan hit protection (as in OctoMap): a scan's rays never clear a
-    // cell the same scan hit.  Otherwise a scan's noisy points behind a wall
-    // send rays through that wall's cells and erode it — worst for far,
+    // cell (layer) the same scan hit.  Otherwise a scan's noisy points behind
+    // a wall send rays through that wall's cells and erode it — worst for far,
     // weakly-weighted walls.  Rays from other scans can still clear it.
-    std::vector<uint32_t> hit_stamp(gw * gh, 0);
+    std::vector<uint32_t> hit_stamp(N * kLayers, 0);
     uint32_t scan_no = 0;
 
+    // Layer of a height; -1 = outside the wall band (height-aware mode only).
+    auto layer_of = [&](float z) -> int {
+      if (!kHeightAwareFree) return 0;
+      if (z < kWallZlo || z >= kWallZhi) return -1;
+      return std::min(kLayers - 1, (int)((z - kWallZlo) / kLayerH));
+    };
+
+    // f(x, y, step, n_steps): step 0 = ray origin, step n_steps = endpoint.
     auto bresenham = [&](int x0, int y0, int x1, int y1, auto &&f) {
       int dx = std::abs(x1-x0), dy = std::abs(y1-y0);
       int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
       int err = dx - dy;
-      for (;;) {
-        f(x0, y0);
+      const int n = std::max(dx, dy);
+      for (int i = 0;; ++i) {
+        f(x0, y0, i, n);
         if (x0 == x1 && y0 == y1) break;
         int e2 = 2 * err;
         if (e2 > -dy) { err -= dy; x0 += sx; }
@@ -1479,7 +2148,8 @@ void WCDatabaseExporter::finalize_and_return_result(Result &result)
         if (p.z < kWallZlo || p.z > kWallZhi) continue;
         int hcx, hcy;
         to_cell(p.x, p.y, hcx, hcy);
-        if (hcx >= 0 && hcx < gw && hcy >= 0 && hcy < gh) hit_stamp[hcy * gw + hcx] = scan_no;
+        const int l = std::max(0, layer_of(std::min(p.z, kWallZhi - 1e-4f)));
+        if (hcx >= 0 && hcx < gw && hcy >= 0 && hcy < gh) hit_stamp[l * N + hcy * gw + hcx] = scan_no;
       }
 
       for (const auto &p : pts) {
@@ -1490,31 +2160,83 @@ void WCDatabaseExporter::finalize_and_return_result(Result &result)
         const float r = std::hypot(p.x - oit->second.x, p.y - oit->second.y);
         const float w = r > kHitRangeRef ? (kHitRangeRef / r) * (kHitRangeRef / r) : 1.0f;
 
-        bresenham(ocx, ocy, ecx, ecy, [&](int cx, int cy) {
+        bresenham(ocx, ocy, ecx, ecy, [&](int cx, int cy, int step, int n_steps) {
           if (cx < 0 || cx >= gw || cy < 0 || cy >= gh) return;
-          int idx = cy * gw + cx;
+          const size_t idx = (size_t)cy * gw + cx;
           if (cx == ecx && cy == ecy) {
             if (wall_hit) {
-              lo[idx] = std::min(lo[idx] + kLogOccHit * w, kLogClamp);
+              const int l = std::max(0, layer_of(std::min(p.z, kWallZhi - 1e-4f)));
+              float &v = lo[l * N + idx];
+              v = std::min(v + kLogOccHit * w, kLogClamp);
               min_hit_r[idx] = std::min(min_hit_r[idx], r);
               sum_w += w;
               ++n_hits;
             }
-          } else if (hit_stamp[idx] == scan_no) {
+            return;
+          }
+          const float t = n_steps > 0 ? (float)step / n_steps : 1.0f;
+          const float zr = kSensorZ + t * (p.z - kSensorZ);  // ray height at this cell
+          if (kHeightVeto && hw[idx] >= kVetoMinW &&
+              (zr > veto_hi[idx] + kVetoMargin || zr < veto_lo[idx] - kVetoMargin)) {
+            ++n_free_vetoed;
+            return;
+          }
+          const int l = layer_of(zr);
+          if (l < 0) { ++n_free_outside; return; }
+          if (hit_stamp[l * N + idx] == scan_no) {
             ++n_free_protected;
           } else {
-            lo[idx] = std::max(lo[idx] - kLogFreeMiss, -kLogClamp);
+            float &v = lo[l * N + idx];
+            v = std::max(v - kLogFreeMiss, -kLogClamp);
             ++n_free_upd;
           }
         });
       }
     }
 
-    for (int i = 0; i < gw * gh; ++i) {
-      if      (lo[i] > 0.0f) grid[i] = 100;
-      else if (lo[i] < 0.0f) grid[i] = 0;
-      // lo[i] == 0: no evidence → stays unknown (-1)
+    for (size_t i = 0; i < N; ++i) {
+      bool occ = false, fr = false;
+      for (int l = 0; l < kLayers; ++l) {
+        const float v = lo[l * N + i];
+        if (v > 0.0f) occ = true;
+        else if (v < 0.0f) fr = true;
+      }
+      if      (occ) grid[i] = 100;
+      else if (fr)  grid[i] = 0;
+      // no evidence in any layer → stays unknown (-1)
     }
+    if (kNearKeep) {
+      size_t n_kept = 0;
+      for (size_t i = 0; i < N; ++i)
+        if (grid[i] != 100 && near_hits[i] >= kKeepMinHits && near_scans[i] >= kKeepMinScans &&
+            t_last[i] - t_first[i] >= kSpanMinSeconds) {   // same persistence test: people pass close too
+          grid[i] = 100;
+          ++n_kept;
+        }
+      printf("[grid] near-range keep: %zu cells restored as occupied\n", n_kept);
+      add_metric("grid near-range keep: %zu cells (%.2f m2) kept occupied (>= %d hits from < %.1f m by >= %d scans)",
+                 n_kept, n_kept * (double)kRes * kRes, kKeepMinHits, kNearR, kKeepMinScans);
+    }
+    if (kSpanKeep) {
+      size_t n_kept = 0, n_flag = 0, n_transient = 0;
+      for (size_t i = 0; i < N; ++i) {
+        if (all_hits[i] < kSpanMinHits || all_scans[i] < kSpanMinScans) continue;
+        if (hz_max[i] - hz_min[i] > kSpanMaxDz) continue;
+        if (t_last[i] - t_first[i] < kSpanMinSeconds) { ++n_transient; continue; }
+        feature_keep[i] = 1; ++n_flag;
+        if (grid[i] != 100) { grid[i] = 100; ++n_kept; }
+      }
+      printf("[grid] height-span keep: %zu cells restored (%zu flagged, %zu transient skipped)\n", n_kept, n_flag, n_transient);
+      add_metric("grid height-span keep: %zu cells (%.2f m2) restored, %zu flagged, %zu transient skipped (>= %d hits, >= %d scans, z span <= %.2f m, seen over >= %.0f s; exempt from CC filter)",
+                 n_kept, n_kept * (double)kRes * kRes, n_flag, n_transient, kSpanMinHits, kSpanMinScans, kSpanMaxDz, kSpanMinSeconds);
+    }
+  }
+  {
+    const double tot = std::max<size_t>(1, n_free_outside + n_free_upd + n_free_protected + n_free_vetoed);
+    add_metric("grid free space: %s%s  (sensor z=%.2f m)  ray cells skipped: outside band %.1f%%, height veto %.2f%% (min w %.1f, margin %.2f m, range %s)",
+               kHeightAwareFree ? "height layers" : "2D", kHeightVeto ? " + height veto" : "", kSensorZ,
+               100.0 * n_free_outside / tot, 100.0 * n_free_vetoed / tot, kVetoMinW, kVetoMargin,
+               kVetoPercentile ? "hit z p10-p90" : "hit z min-max");
   }
   printf("[grid] %d × %d cells  (%.1f × %.1f m)  log-odds raytrace"
          "  wall=[%.2f,%.2f m]  occ+=%.2f·w(r)  free-=%.2f  w ref=%.1f m\n",
@@ -1559,8 +2281,8 @@ void WCDatabaseExporter::finalize_and_return_result(Result &result)
       for (int c = 0; c < gw; ++c) {
         int lbl = labels.at<int>(r, c);
         if (lbl == 0) continue;  // background
-        if (stats.at<int>(lbl, cv::CC_STAT_AREA) < kMinComponentCells)
-          grid[r * gw + c] = -1;  // remove small blob → unknown
+        if (stats.at<int>(lbl, cv::CC_STAT_AREA) < kMinComponentCells && !feature_keep[r * gw + c])
+          grid[r * gw + c] = -1;  // remove small blob → unknown (height-span features exempt)
       }
     printf("[grid] CC filter: removed blobs < %d cells  (%d components total)\n",
            kMinComponentCells, n_labels - 1);
@@ -1632,10 +2354,250 @@ void WCDatabaseExporter::finalize_and_return_result(Result &result)
     add_metric("grid occupied by nearest hit range: <1.3m %.1f%%  1.3-1.9m %.1f%%  >1.9m %.1f%%  morph-only %.1f%%",
                100.0 * n_near / tot, 100.0 * n_mid / tot, 100.0 * n_far / tot, 100.0 * n_nohit / tot);
   }
+
+  // ── 7. Wall thinning (env WC_THIN_WALLS=1) ──────────────────────────────
+  // Wall-like occupied cells are reduced to a centre line (Zhang–Suen), spurs
+  // shorter than kThinPrune cells are trimmed, and the line is redrawn
+  // kThinWidth cells wide (7.5 cm).  Untouched:
+  //   - height-span feature cells (feature_keep), dilated by 1 cell;
+  //   - furniture: cells >= kThinBlobDt from the edge, in compact cores of
+  //     >= kThinMinSeed cells (a core >= kThinElong:1 and >= kThinMinWallLen
+  //     long is a thick wall and IS thinned), grown back over the footprint;
+  //   - ledge walls, found automatically: most outer walls carry a ~0.75 m
+  //     ledge 12–15 cm deep, and for the chair its front is the obstacle edge,
+  //     so those walls stay thick.  Seeds = occupied cells within
+  //     kLedgeNearUnk of unknown space (outer walls) whose hits all sit high
+  //     (hit-height p10 >= kLedgeZmin, weight >= 2) — the ledge front.  Seed
+  //     runs shorter than kLedgeMinLen (after bridging 2-cell gaps) are
+  //     dropped; protected = occupied cells within kLedgeNearUnk of unknown
+  //     and kLedgeGrow of a seed.  On 10-12-01 this finds all 14 squares the
+  //     user marked except one short wall (F2), plus the ledge continuing
+  //     along the bottom wall (D6, F6–H6) and in H1/J2.
+  //     Optional extra squares: WC_LEDGE_SQUARES="B2 K3" (50-cell squares of
+  //     the saved PGM, columns A.. left to right, rows 1.. top to bottom).
+  // Removed cells become free if nearer free than unknown space, else unknown;
+  // removed cells that would let free space touch unknown space are put back.
+  // Validated in Python (analysis/thin_walls.py --auto-ledge) on 10-12-01:
+  // walls 11.5 -> 7.5 cm median, no new openings, features and furniture kept.
+  // On by default; WC_THIN_WALLS=0 disables.
+  // Runs in PGM orientation (row 0 = max y) so it matches the Python exactly.
+  {
+    const char *tw_env = std::getenv("WC_THIN_WALLS");
+    const bool kThinWalls = !(tw_env && std::atoi(tw_env) == 0);
+    if (kThinWalls) {
+      constexpr float kThinBlobDt     = 3.5f;   // cells (core >= ~17.5 cm thick)
+      constexpr int   kThinMinSeed    = 12;     // cells
+      constexpr float kThinElong      = 4.0f;
+      constexpr float kThinMinWallLen = 20.0f;  // cells (50 cm)
+      constexpr int   kThinPrune      = 5;      // cells (12.5 cm spurs)
+      constexpr int   kThinWidth      = 3;      // cells (7.5 cm)
+      constexpr float kThinLedgeBand  = 8.0f;   // cells (20 cm)
+      constexpr int   kThinSquare     = 50;     // cells per labelled square
+      constexpr float kLedgeZmin      = 0.50f;  // m, hit-height p10 of a ledge-front cell
+      constexpr float kLedgeNearUnk   = 10.0f;  // cells (25 cm) from unknown space
+      constexpr float kLedgeMinLen    = 20.0f;  // cells (50 cm) of seed run
+      constexpr int   kLedgeGrow      = 6;      // cells (15 cm) from a seed
+      const int H = gh, W = gw;
+      auto at = [&](int ir, int c) -> int8_t & { return grid[(size_t)(H - 1 - ir) * W + c]; };
+      cv::Mat occ(H, W, CV_8U, cv::Scalar(0)), fre(H, W, CV_8U, cv::Scalar(0)), unk(H, W, CV_8U, cv::Scalar(0));
+      cv::Mat feat(H, W, CV_8U, cv::Scalar(0));
+      for (int ir = 0; ir < H; ++ir)
+        for (int c = 0; c < W; ++c) {
+          const int8_t v = at(ir, c);
+          if (v == 100) occ.at<uint8_t>(ir, c) = 1;
+          else if (v == 0) fre.at<uint8_t>(ir, c) = 1;
+          else unk.at<uint8_t>(ir, c) = 1;
+          if (feature_keep[(size_t)(H - 1 - ir) * W + c]) feat.at<uint8_t>(ir, c) = 1;
+        }
+      const cv::Mat k3 = cv::Mat::ones(3, 3, CV_8U);
+      // distance (cells) to the nearest cell of a class
+      auto dist_to = [&](const cv::Mat &cls) {
+        cv::Mat src = (cls == 0) / 255, d;   // 1 where not the class, 0 on the class
+        cv::distanceTransform(src, d, cv::DIST_L2, 5);
+        return d;
+      };
+      // protected: features
+      cv::Mat prot;
+      cv::dilate(feat, prot, k3);
+      prot = prot & occ;
+      // protected: compact thick cores (furniture)
+      cv::Mat dt_occ;
+      cv::distanceTransform(occ, dt_occ, cv::DIST_L2, 5);
+      cv::Mat seed = (dt_occ >= kThinBlobDt) / 255;
+      cv::Mat lab, st, cen;
+      const int n_lab = cv::connectedComponentsWithStats(seed, lab, st, cen, 8);
+      std::vector<std::vector<cv::Point2f>> comp_pts(n_lab);
+      for (int ir = 0; ir < H; ++ir)
+        for (int c = 0; c < W; ++c) {
+          const int l = lab.at<int>(ir, c);
+          if (l > 0) comp_pts[l].emplace_back((float)c, (float)ir);
+        }
+      cv::Mat keep_seed(H, W, CV_8U, cv::Scalar(0));
+      int n_furn = 0, n_thick_wall = 0;
+      for (int l = 1; l < n_lab; ++l) {
+        if (st.at<int>(l, cv::CC_STAT_AREA) < kThinMinSeed) continue;
+        const cv::RotatedRect rr = cv::minAreaRect(comp_pts[l]);
+        const float lng = std::max(rr.size.width, rr.size.height) + 1.0f;
+        const float sht = std::min(rr.size.width, rr.size.height) + 1.0f;
+        if (lng >= kThinElong * sht && lng >= kThinMinWallLen) { ++n_thick_wall; continue; }
+        ++n_furn;
+        for (const auto &p : comp_pts[l]) keep_seed.at<uint8_t>((int)p.y, (int)p.x) = 1;
+      }
+      cv::Mat blob;
+      cv::dilate(keep_seed, blob, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(9, 9)));
+      blob = blob & occ;
+      // protected: ledge walls in the listed squares
+      const cv::Mat d_unk = dist_to(unk), d_free = dist_to(fre);
+      cv::Mat ledge(H, W, CV_8U, cv::Scalar(0));
+      int n_ledge_seed = 0, n_ledge_runs = 0;
+      if (!cell_zlo.empty() && !cell_hw.empty()) {
+        cv::Mat lseed(H, W, CV_8U, cv::Scalar(0));
+        for (int ir = 0; ir < H; ++ir)
+          for (int c = 0; c < W; ++c) {
+            const size_t gi = (size_t)(H - 1 - ir) * W + c;
+            if (occ.at<uint8_t>(ir, c) && cell_hw[gi] >= 2.0f && cell_zlo[gi] >= kLedgeZmin &&
+                d_unk.at<float>(ir, c) <= kLedgeNearUnk)
+              lseed.at<uint8_t>(ir, c) = 1;
+          }
+        cv::Mat joined, llab, lst, lcen;
+        cv::dilate(lseed, joined, cv::Mat::ones(5, 5, CV_8U));
+        const int nl = cv::connectedComponentsWithStats(joined, llab, lst, lcen, 8);
+        std::vector<std::vector<cv::Point2f>> lpts(nl);
+        for (int ir = 0; ir < H; ++ir)
+          for (int c = 0; c < W; ++c) {
+            const int l = llab.at<int>(ir, c);
+            if (l > 0) lpts[l].emplace_back((float)c, (float)ir);
+          }
+        std::vector<uint8_t> lkeep(nl, 0);
+        for (int l = 1; l < nl; ++l) {
+          const cv::RotatedRect rr = cv::minAreaRect(lpts[l]);
+          if (std::max(rr.size.width, rr.size.height) >= kLedgeMinLen) { lkeep[l] = 1; ++n_ledge_runs; }
+        }
+        for (int ir = 0; ir < H; ++ir)
+          for (int c = 0; c < W; ++c)
+            if (lseed.at<uint8_t>(ir, c) && !lkeep[llab.at<int>(ir, c)]) lseed.at<uint8_t>(ir, c) = 0;
+        n_ledge_seed = cv::countNonZero(lseed);
+        cv::Mat near;
+        cv::dilate(lseed, near, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * kLedgeGrow + 1, 2 * kLedgeGrow + 1)));
+        for (int ir = 0; ir < H; ++ir)
+          for (int c = 0; c < W; ++c)
+            if (near.at<uint8_t>(ir, c) && occ.at<uint8_t>(ir, c) && d_unk.at<float>(ir, c) <= kLedgeNearUnk)
+              ledge.at<uint8_t>(ir, c) = 1;
+      }
+      std::string ledge_list;
+      if (const char *e = std::getenv("WC_LEDGE_SQUARES")) {
+        std::istringstream ss(e);
+        std::string sq;
+        while (ss >> sq) {
+          if (sq.size() < 2 || !std::isalpha((unsigned char)sq[0])) continue;
+          const int cs = std::toupper((unsigned char)sq[0]) - 'A', rs = std::atoi(sq.c_str() + 1) - 1;
+          if (rs < 0) continue;
+          for (int ir = rs * kThinSquare; ir < std::min(H, (rs + 1) * kThinSquare); ++ir)
+            for (int c = cs * kThinSquare; c < std::min(W, (cs + 1) * kThinSquare); ++c)
+              if (occ.at<uint8_t>(ir, c) && d_unk.at<float>(ir, c) <= kThinLedgeBand) ledge.at<uint8_t>(ir, c) = 1;
+          ledge_list += (ledge_list.empty() ? "" : " ") + sq;
+        }
+      }
+      cv::Mat protect = prot | blob | ledge;
+      cv::Mat wall = occ & (1 - protect);
+
+      // Zhang–Suen thinning (as cv::ximgproc::thinning, THINNING_ZHANGSUEN)
+      cv::Mat sk = wall.clone();
+      for (bool changed = true; changed;) {
+        changed = false;
+        for (int iter = 0; iter < 2; ++iter) {
+          cv::Mat marker(H, W, CV_8U, cv::Scalar(0));
+          for (int i = 1; i < H - 1; ++i)
+            for (int j = 1; j < W - 1; ++j) {
+              if (!sk.at<uint8_t>(i, j)) continue;
+              const int p2 = sk.at<uint8_t>(i - 1, j), p3 = sk.at<uint8_t>(i - 1, j + 1);
+              const int p4 = sk.at<uint8_t>(i, j + 1), p5 = sk.at<uint8_t>(i + 1, j + 1);
+              const int p6 = sk.at<uint8_t>(i + 1, j), p7 = sk.at<uint8_t>(i + 1, j - 1);
+              const int p8 = sk.at<uint8_t>(i, j - 1), p9 = sk.at<uint8_t>(i - 1, j - 1);
+              const int A = (p2 == 0 && p3 == 1) + (p3 == 0 && p4 == 1) + (p4 == 0 && p5 == 1) + (p5 == 0 && p6 == 1) +
+                            (p6 == 0 && p7 == 1) + (p7 == 0 && p8 == 1) + (p8 == 0 && p9 == 1) + (p9 == 0 && p2 == 1);
+              const int B = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9;
+              const int m1 = iter == 0 ? p2 * p4 * p6 : p2 * p4 * p8;
+              const int m2 = iter == 0 ? p4 * p6 * p8 : p2 * p6 * p8;
+              if (A == 1 && B >= 2 && B <= 6 && m1 == 0 && m2 == 0) marker.at<uint8_t>(i, j) = 1;
+            }
+          if (cv::countNonZero(marker)) { sk = sk & (1 - marker); changed = true; }
+        }
+      }
+      // spur pruning: peel endpoints kThinPrune times, regrow along the skeleton
+      auto endpoints = [&](const cv::Mat &s) {
+        cv::Mat n;
+        cv::filter2D(s, n, CV_32F, cv::Mat::ones(3, 3, CV_32F), cv::Point(-1, -1), 0, cv::BORDER_CONSTANT);
+        cv::Mat sf; s.convertTo(sf, CV_32F);
+        return (s > 0) & ((n - sf) == 1.0f);     // 255 where endpoint
+      };
+      cv::Mat s = sk.clone();
+      for (int k = 0; k < kThinPrune; ++k) s = s & (1 - endpoints(s) / 255);
+      cv::Mat grow = s.clone();
+      for (int k = 0; k < kThinPrune; ++k) {
+        cv::Mat ep = endpoints(grow) / 255, epd;
+        cv::dilate(ep, epd, k3);
+        grow = grow | (epd & sk);
+      }
+      cv::Mat new_wall;
+      cv::dilate(grow, new_wall, cv::Mat::ones(kThinWidth, kThinWidth, CV_8U));
+      new_wall = new_wall & (wall | fre);
+      cv::Mat removed = wall & (1 - new_wall);
+
+      // write back: removed -> free / unknown, new wall and protected -> occupied
+      for (int ir = 0; ir < H; ++ir)
+        for (int c = 0; c < W; ++c) {
+          if (removed.at<uint8_t>(ir, c))
+            at(ir, c) = d_free.at<float>(ir, c) <= d_unk.at<float>(ir, c) ? 0 : -1;
+          if (new_wall.at<uint8_t>(ir, c) || protect.at<uint8_t>(ir, c)) at(ir, c) = 100;
+        }
+      // seal: no free/unknown contact that the input grid did not have
+      auto contact = [&](bool from_grid, const cv::Mat &f0, const cv::Mat &u0) {
+        cv::Mat f(H, W, CV_8U), u(H, W, CV_8U);
+        for (int ir = 0; ir < H; ++ir)
+          for (int c = 0; c < W; ++c) {
+            const int8_t v = from_grid ? at(ir, c) : (f0.at<uint8_t>(ir, c) ? 0 : (u0.at<uint8_t>(ir, c) ? -1 : 100));
+            f.at<uint8_t>(ir, c) = v == 0; u.at<uint8_t>(ir, c) = v == -1;
+          }
+        cv::Mat out(H, W, CV_8U, cv::Scalar(0));
+        for (int ir = 0; ir < H; ++ir)
+          for (int c = 0; c < W; ++c) {
+            const bool fr = f.at<uint8_t>(ir, c), un = u.at<uint8_t>(ir, c);
+            if (!fr && !un) continue;
+            const cv::Mat &other = fr ? u : f;
+            if ((ir > 0 && other.at<uint8_t>(ir - 1, c)) || (ir < H - 1 && other.at<uint8_t>(ir + 1, c)) ||
+                (c > 0 && other.at<uint8_t>(ir, c - 1)) || (c < W - 1 && other.at<uint8_t>(ir, c + 1)))
+              out.at<uint8_t>(ir, c) = 1;
+          }
+        return out;
+      };
+      const cv::Mat base = contact(false, fre, unk);
+      size_t n_restored = 0;
+      for (int it = 0; it < 20; ++it) {
+        const cv::Mat now = contact(true, fre, unk);
+        size_t n_it = 0;
+        for (int ir = 0; ir < H; ++ir)
+          for (int c = 0; c < W; ++c)
+            if (now.at<uint8_t>(ir, c) && !base.at<uint8_t>(ir, c) && removed.at<uint8_t>(ir, c) && at(ir, c) != 100) {
+              at(ir, c) = 100; ++n_it;
+            }
+        n_restored += n_it;
+        if (n_it == 0) break;
+      }
+      const size_t n_removed = (size_t)cv::countNonZero(removed) - n_restored;
+      printf("[grid] wall thinning: %zu cells removed (%zu put back by the seal); protected: features %d, furniture %d, ledge %d cells\n",
+             n_removed, n_restored, cv::countNonZero(prot), cv::countNonZero(blob), cv::countNonZero(ledge));
+      add_metric("grid wall thinning (WC_THIN_WALLS=0 disables): %zu cells (%.2f m2) removed, %zu put back by the seal; walls redrawn %d cells wide; protected cells: features %d, furniture %d (%d compact cores, %d thick-wall cores thinned), ledge %d (auto: %d seed cells in %d runs; extra squares \"%s\")",
+                 n_removed, n_removed * (double)kRes * kRes, n_restored, kThinWidth,
+                 cv::countNonZero(prot), cv::countNonZero(blob), n_furn, n_thick_wall, cv::countNonZero(ledge),
+                 n_ledge_seed, n_ledge_runs, ledge_list.c_str());
+    }
+  }
 #endif  // WC_GRID_DIRECT_PROJECTION
 
   // ── 7. PCA rotation — orient map so widest extent is horizontal ──────────
-  {
+  // Only with WC_GRID_ALIGN=pca; step 1 aligns the grid with WC_GRID_ALIGN=1.
+  if (kGridAlign == 2) {
     // Encode grid into uint8 image: 255=occupied, 128=free, 0=unknown
     cv::Mat grid_mat(gh, gw, CV_8U, cv::Scalar(0));
     for (int r = 0; r < gh; ++r)
@@ -1779,7 +2741,7 @@ void WCDatabaseExporter::finalize_and_return_result(Result &result)
 
   // ── 5. Save grid PGM + YAML ───────────────────────────────────────────
   {
-    std::string grid_path = path + "/grid/" + timestamp_;
+    std::string grid_path = path + "/grid/" + grid_name;
     nav2_map_server::SaveParameters sp;
     sp.map_file_name   = grid_path;
     sp.image_format    = "pgm";
@@ -1787,6 +2749,149 @@ void WCDatabaseExporter::finalize_and_return_result(Result &result)
     sp.occupied_thresh = 0.65;
     nav2_map_server::saveMapToFile(*rtabmap_occupancy_grid_, sp);
     printf("[grid] Saved grid → %s.{pgm,yaml}\n", grid_path.c_str());
+
+    // Ground truth -> map transform, appended to the map YAML (map_server
+    // ignores extra keys).  Fitted over the whole drive: graph node positions
+    // vs /ground_truth/odom interpolated at the node stamps (SE(2) least
+    // squares).  On four recordings that is 33–38 mm median error; anchoring on
+    // /ground_truth/initial_pose alone (GT pose at the first node) gave 76–173 mm,
+    // because the map rotation then hangs on the first node's graph heading
+    // (~2° heading error per node).  initial_pose is still written for reference.
+    // gt_heading_offset_deg = median(GT yaw − map heading after the fit): the
+    // ceiling camera reads +2.4..+2.7° high against the map's headings (four
+    // recordings); subtract it from GT yaw before comparing headings.
+    // Bag: WC_GT_BAG, else <db dir>/tf_<db name>.  Skipped without a bag.
+    {
+      std::string gt_bag;
+      if (const char *e = std::getenv("WC_GT_BAG")) gt_bag = e;
+      else {
+        const std::string db = rtabmap_database_path_;
+        const size_t sl = db.rfind('/');
+        const std::string dir = sl == std::string::npos ? "." : db.substr(0, sl);
+        std::string name = sl == std::string::npos ? db : db.substr(sl + 1);
+        if (name.size() > 3 && name.compare(name.size() - 3, 3, ".db") == 0) name.resize(name.size() - 3);
+        gt_bag = dir + "/tf_" + name;
+      }
+      auto first = viz_poses_.lower_bound(1);
+      if (access((gt_bag + "/metadata.yaml").c_str(), F_OK) != 0) {
+        add_metric("ground truth tf: no bag at %s (set WC_GT_BAG) — not added to the map yaml", gt_bag.c_str());
+      } else if (first == viz_poses_.end()) {
+        add_metric("ground truth tf: no graph nodes — not added to the map yaml");
+      } else {
+        auto nit0 = nodes.find(first->first);
+        const double t_first = nit0 != nodes.end() ? nit0->second.getStamp() : 0.0;
+        auto yaw_of = [](const geometry_msgs::msg::Quaternion &q) {
+          return std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+        };
+        auto wrap = [](double a) { return std::atan2(std::sin(a), std::cos(a)); };
+        struct GtS { double t, x, y, yaw; };
+        std::vector<GtS> gt;
+        bool have_ip = false;
+        double ix = 0, iy = 0, iyaw = 0, it = 0;
+        std::string gt_frame;
+        try {
+          rosbag2_cpp::Reader reader;
+          rosbag2_storage::StorageOptions so;
+          so.uri = gt_bag;
+          so.storage_id = "mcap";
+          reader.open(so);
+          rosbag2_storage::StorageFilter filt;
+          filt.topics = {"/ground_truth/initial_pose", "/ground_truth/odom"};
+          reader.set_filter(filt);
+          rclcpp::Serialization<geometry_msgs::msg::PoseWithCovarianceStamped> ser_ip;
+          rclcpp::Serialization<nav_msgs::msg::Odometry> ser_od;
+          while (reader.has_next()) {
+            auto m = reader.read_next();
+            rclcpp::SerializedMessage sm(*m->serialized_data);
+            if (m->topic_name == "/ground_truth/odom") {
+              nav_msgs::msg::Odometry msg;
+              ser_od.deserialize_message(&sm, &msg);
+              gt.push_back({msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec,
+                            msg.pose.pose.position.x, msg.pose.pose.position.y, yaw_of(msg.pose.pose.orientation)});
+              if (gt_frame.empty() && !msg.header.frame_id.empty()) gt_frame = msg.header.frame_id;
+            } else if (m->topic_name == "/ground_truth/initial_pose") {
+              geometry_msgs::msg::PoseWithCovarianceStamped msg;
+              ser_ip.deserialize_message(&sm, &msg);
+              const double t = msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec;
+              if (t > t_first + 1.0 || (have_ip && t < it)) continue;   // last one before the recording
+              ix = msg.pose.pose.position.x; iy = msg.pose.pose.position.y;
+              iyaw = yaw_of(msg.pose.pose.orientation); it = t; have_ip = true;
+            }
+          }
+        } catch (const std::exception &e) {
+          printf("[gt] could not read %s: %s\n", gt_bag.c_str(), e.what());
+        }
+        if (gt_frame.empty()) gt_frame = "ground_truth";
+        std::sort(gt.begin(), gt.end(), [](const GtS &a, const GtS &b) { return a.t < b.t; });
+        // node positions (map) and GT interpolated at the node stamps (gaps <= 0.1 s)
+        std::vector<std::array<double, 3>> mp, gp;
+        for (const auto &[nid, P] : viz_poses_) {
+          if (nid < 1) continue;
+          auto nit = nodes.find(nid);
+          if (nit == nodes.end() || gt.size() < 2) continue;
+          const double t = nit->second.getStamp();
+          auto hi = std::lower_bound(gt.begin(), gt.end(), t, [](const GtS &g, double v) { return g.t < v; });
+          if (hi == gt.begin() || hi == gt.end()) continue;
+          auto lo = hi - 1;
+          if (hi->t - lo->t > 0.1) continue;
+          const double u = (t - lo->t) / std::max(1e-9, hi->t - lo->t);
+          mp.push_back({P.x(), P.y(), P.theta()});
+          gp.push_back({lo->x + u * (hi->x - lo->x), lo->y + u * (hi->y - lo->y), lo->yaw + u * wrap(hi->yaw - lo->yaw)});
+        }
+        if (mp.size() < 50) {
+          add_metric("ground truth tf: only %zu nodes with ground truth in %s — not added", mp.size(), gt_bag.c_str());
+        } else {
+          // SE(2) least squares: g = R m + t
+          double mx = 0, my = 0, gx = 0, gy = 0;
+          for (size_t k = 0; k < mp.size(); ++k) { mx += mp[k][0]; my += mp[k][1]; gx += gp[k][0]; gy += gp[k][1]; }
+          mx /= mp.size(); my /= mp.size(); gx /= gp.size(); gy /= gp.size();
+          double sc = 0, ss = 0;
+          for (size_t k = 0; k < mp.size(); ++k) {
+            const double ax = mp[k][0] - mx, ay = mp[k][1] - my, bx = gp[k][0] - gx, by = gp[k][1] - gy;
+            sc += ax * bx + ay * by; ss += ax * by - ay * bx;
+          }
+          const double th = std::atan2(ss, sc), c = std::cos(th), sn = std::sin(th);
+          const double tx = gx - (c * mx - sn * my), ty = gy - (sn * mx + c * my);
+          std::vector<double> err, dh;
+          for (size_t k = 0; k < mp.size(); ++k) {
+            const double px = c * mp[k][0] - sn * mp[k][1] + tx, py = sn * mp[k][0] + c * mp[k][1] + ty;
+            err.push_back(1000.0 * std::hypot(px - gp[k][0], py - gp[k][1]));
+            dh.push_back(wrap(gp[k][2] - (th + mp[k][2])));
+          }
+          auto pct = [](std::vector<double> v, double q) {
+            std::nth_element(v.begin(), v.begin() + (size_t)(q * (v.size() - 1)), v.end());
+            return v[(size_t)(q * (v.size() - 1))];
+          };
+          const double e50 = pct(err, 0.5), e90 = pct(err, 0.9), hoff = pct(dh, 0.5);
+          std::ofstream yf(grid_path + ".yaml", std::ios::app);
+          yf << std::fixed << std::setprecision(6)
+             << "\n"   // nav2's saveMapToFile leaves no trailing newline
+             << "# Ground truth -> map: pose of the map frame in the ground-truth frame, fitted over the whole drive\n"
+             << "# (graph node positions vs /ground_truth/odom).  static TF: parent gt_frame, child map,\n"
+             << "# translation (x, y, 0), rotation yaw (rad) about z.\n"
+             << "gt_frame: " << gt_frame << "\n"
+             << "gt_to_map: {x: " << tx << ", y: " << ty << ", yaw: " << th << "}\n"
+             << std::setprecision(1)
+             << "gt_fit_error_mm: {median: " << e50 << ", p90: " << e90 << ", nodes: " << mp.size() << "}\n"
+             << std::setprecision(3)
+             << "# GT yaw minus map heading (deg); subtract from GT yaw before comparing headings.\n"
+             << "gt_heading_offset_deg: " << hoff * 180.0 / M_PI << "\n";
+          if (have_ip) {
+            // reference only: the single-pose transform from initial_pose
+            const rtabmap::Transform IP((float)ix, (float)iy, (float)(iyaw - hoff));
+            const rtabmap::Transform N0(first->second.x(), first->second.y(), first->second.theta());
+            const rtabmap::Transform Ti = IP * N0.inverse();
+            yf << std::setprecision(6)
+               << "# Reference only (less accurate): from /ground_truth/initial_pose alone (GT pose at the first node).\n"
+               << "gt_initial_pose: {x: " << ix << ", y: " << iy << ", yaw: " << iyaw
+               << ", stamp: " << std::setprecision(3) << it << "}\n" << std::setprecision(6)
+               << "gt_to_map_from_initial_pose: {x: " << Ti.x() << ", y: " << Ti.y() << ", yaw: " << Ti.theta() << "}\n";
+          }
+          add_metric("ground truth tf: %s -> map  x %.4f y %.4f yaw %.3f deg  fitted over %zu nodes, error median %.0f mm p90 %.0f mm; GT heading offset %+.2f deg (written to the map yaml)",
+                     gt_frame.c_str(), tx, ty, th * 180.0 / M_PI, mp.size(), e50, e90, hoff * 180.0 / M_PI);
+        }
+      }
+    }
   }
 
   // ── 6. Tag overlay PNG ────────────────────────────────────────────────
@@ -1803,9 +2908,11 @@ void WCDatabaseExporter::finalize_and_return_result(Result &result)
         img(cv::Rect(c*S, ih-1-r*S-S+1, S, S)).setTo(cv::Scalar(col[0],col[1],col[2]));
       }
 
-    // Helper: world XY → image pixel.
+    // Helper: world XY → image pixel (through the same alignment as the grid,
+    // so path and tags land on the walls they belong to).
     auto wp = [&](float x, float y) -> cv::Point {
-      return { (int)((x-xmin)/kRes*S), ih-1-(int)((y-ymin)/kRes*S) };
+      const cv::Point2f q = rot(x, y);
+      return { (int)((q.x-xmin)/kRes*S), ih-1-(int)((q.y-ymin)/kRes*S) };
     };
 
     // Draw robot path.
@@ -1855,13 +2962,24 @@ void WCDatabaseExporter::finalize_and_return_result(Result &result)
                 {4, ih-6}, cv::FONT_HERSHEY_SIMPLEX, 0.38,
                 cv::Scalar(100,100,100), 1, cv::LINE_AA);
 
-    std::string tag_png = path + "/grid/" + timestamp_ + "_tags.png";
+    std::string tag_png = path + "/grid/" + grid_name + "_tags.png";
     cv::imwrite(tag_png, img);
     printf("[grid] Tag overlay → %s\n", tag_png.c_str());
   }
 
   // ── Copy-paste metrics block (also saved to <output>/metrics.txt) ─────
   {
+    add_metric("pipeline: %s  (source sha256 %s)", PIPELINE_NAME, PIPELINE_SRC_SHA256);
+    {
+      // every WC_* setting this run used (env), sorted, so runs record their switches
+      std::vector<std::string> env;
+      for (char **e = environ; e && *e; ++e)
+        if (std::strncmp(*e, "WC_", 3) == 0) env.emplace_back(*e);
+      std::sort(env.begin(), env.end());
+      std::string line;
+      for (const auto &kv : env) line += (line.empty() ? "" : " ") + kv;
+      add_metric("env: %s", line.empty() ? "(no WC_* settings — all defaults)" : line.c_str());
+    }
     add_metric("output=%s  total runtime %.0f s", timestamp_.c_str(), run_timer_.elapsed());
     std::ofstream mf(path + "/metrics.txt");
     printf("\n===== METRICS (copy from here) =====\n");

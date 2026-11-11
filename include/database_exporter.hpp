@@ -88,7 +88,12 @@ struct BoundingBox {
 
 class DatabaseExporter {
 public:
-  DatabaseExporter(std::string rtabmap_database_name, std::string model_name);
+  // output_name: this run's folder name (default: the run timestamp);
+  // output_subdir: folder under output/ it goes in (default: none).
+  // main.cpp passes "<db>_frozen" in "<db>", main_dev.cpp "<db>_dev_<N>" in "<db>",
+  // so a recording's runs and comparisons all sit in output/<db>/.
+  DatabaseExporter(std::string rtabmap_database_name, std::string model_name,
+                   std::string output_name = "", std::string output_subdir = "");
   virtual ~DatabaseExporter();
 
   // @brief Load the rtabmap database
@@ -113,7 +118,8 @@ protected:
 
   std::string rtabmap_database_path_;
   std::string model_path_;
-  std::string timestamp_;
+  std::string timestamp_;      // this run's name (folder name, default grid / cloud file name)
+  std::string output_path_;    // full path of this run's output folder
   std::vector<cv::Mat> images_;
   std::vector<std::vector<rtabmap::CameraModel>> camera_models_;
   std::vector<std::vector<rtabmap::StereoCameraModel>> stereo_models_;

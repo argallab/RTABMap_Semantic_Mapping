@@ -34,16 +34,38 @@ find_package(rosbag2_cpp REQUIRED)
 find_package(rosbag2_storage REQUIRED)
 find_package(tf2_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(PkgConfig REQUIRED)
 # set(CMAKE_PREFIX_PATH "/app/libtorch-cuda12.2")
 find_package(Torch REQUIRED)
 
-add_executable(database_exporter
-    src/main.cpp
-    src/wc_database_exporter.cpp
+# Two executables from the same dependencies:
+#   database_exporter      DEFAULT pipeline, frozen (src/wc_database_exporter.cpp) — same for every user
+#   database_exporter_dev  DEV pipeline, the working copy (src/wc_database_exporter_dev.cpp)
+# Each run writes "pipeline: <name> (source sha256 <hash>)" to metrics.txt; the
+# hash covers that pipeline's exporter source + header, so a changed default
+# pipeline shows up as a different hash.
+set(EXPORTER_COMMON_SRC
     src/database_exporter.cpp
     src/semantic_mapping.cpp
 )
+add_executable(database_exporter     src/main.cpp     src/wc_database_exporter.cpp     ${EXPORTER_COMMON_SRC})
+add_executable(database_exporter_dev src/main_dev.cpp src/wc_database_exporter_dev.cpp ${EXPORTER_COMMON_SRC})
+
+file(SHA256 ${CMAKE_SOURCE_DIR}/src/wc_database_exporter.cpp      SHA_DEFAULT_SRC)
+file(SHA256 ${CMAKE_SOURCE_DIR}/include/wc_database_exporter.hpp  SHA_DEFAULT_HDR)
+file(SHA256 ${CMAKE_SOURCE_DIR}/src/wc_database_exporter_dev.cpp     SHA_DEV_SRC)
+file(SHA256 ${CMAKE_SOURCE_DIR}/include/wc_database_exporter_dev.hpp SHA_DEV_HDR)
+string(SHA256 SHA_DEFAULT "${SHA_DEFAULT_SRC}${SHA_DEFAULT_HDR}")
+string(SHA256 SHA_DEV     "${SHA_DEV_SRC}${SHA_DEV_HDR}")
+string(SUBSTRING ${SHA_DEFAULT} 0 12 SHA_DEFAULT)
+string(SUBSTRING ${SHA_DEV}     0 12 SHA_DEV)
+# re-run CMake (and re-stamp the hash) whenever either exporter source changes
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    src/wc_database_exporter.cpp include/wc_database_exporter.hpp
+    src/wc_database_exporter_dev.cpp include/wc_database_exporter_dev.hpp)
+target_compile_definitions(database_exporter     PRIVATE PIPELINE_NAME="default" PIPELINE_SRC_SHA256="${SHA_DEFAULT}")
+target_compile_definitions(database_exporter_dev PRIVATE PIPELINE_NAME="dev"     PIPELINE_SRC_SHA256="${SHA_DEV}")
 
 include_directories(
     include
@@ -58,25 +80,29 @@ include_directories(
     ${rosbag2_storage_INCLUDE_DIRS}
     ${tf2_msgs_INCLUDE_DIRS}
     ${geometry_msgs_INCLUDE_DIRS}
+    ${nav_msgs_INCLUDE_DIRS}
     ${sensor_msgs_INCLUDE_DIRS}
 )
 
-target_link_libraries(database_exporter PUBLIC
-    ${PCL_LIBRARIES}
-    ${OpenCV_LIBRARIES}
-    ${pcl_conversions_LIBRARIES}
-    ${nav2_map_server_LIBRARIES}
-    rtabmap::rtabmap
-    torch
-    ${rclcpp_LIBRARIES}
-    ${rosbag2_cpp_LIBRARIES}
-    ${rosbag2_storage_LIBRARIES}
-    tf2_msgs::tf2_msgs__rosidl_typesupport_cpp
-    geometry_msgs::geometry_msgs__rosidl_typesupport_cpp
-    sensor_msgs::sensor_msgs__rosidl_typesupport_cpp
-    )
+foreach(exe database_exporter database_exporter_dev)
+  target_link_libraries(${exe} PUBLIC
+      ${PCL_LIBRARIES}
+      ${OpenCV_LIBRARIES}
+      ${pcl_conversions_LIBRARIES}
+      ${nav2_map_server_LIBRARIES}
+      rtabmap::rtabmap
+      torch
+      ${rclcpp_LIBRARIES}
+      ${rosbag2_cpp_LIBRARIES}
+      ${rosbag2_storage_LIBRARIES}
+      tf2_msgs::tf2_msgs__rosidl_typesupport_cpp
+      geometry_msgs::geometry_msgs__rosidl_typesupport_cpp
+      nav_msgs::nav_msgs__rosidl_typesupport_cpp
+      sensor_msgs::sensor_msgs__rosidl_typesupport_cpp
+      )
+endforeach()
 
-install(TARGETS database_exporter 
+install(TARGETS database_exporter database_exporter_dev
     DESTINATION ${CMAKE_BINARY_DIR}/lib
 )
 

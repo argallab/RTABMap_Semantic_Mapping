@@ -36,6 +36,17 @@ LEDGER = os.path.join(ROOT, "analysis", "ledger.csv")
 # ---------------------------------------------------------------------------
 # DB access
 # ---------------------------------------------------------------------------
+def grid_pgm(run: str) -> str:
+    """The exporter grid image of a run folder (grid/<WC_GRID_NAME or timestamp>.pgm)."""
+    import glob
+    ts = os.path.basename(os.path.normpath(run))
+    named = os.path.join(run, "grid", f"{ts}.pgm")
+    if os.path.exists(named):
+        return named
+    found = sorted(glob.glob(os.path.join(run, "grid", "*.pgm")))
+    return found[0] if found else named
+
+
 def connect(db_name: str) -> sqlite3.Connection:
     path = os.path.join(DB_DIR, db_name)
     return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
@@ -233,8 +244,14 @@ def wall_metric(scans: dict, poses: dict, cfg: WallCfg = WallCfg(), bins: dict |
         return None
     tree = cKDTree(xy)
     qstride = max(1, len(xy) // cfg.queries)
-    qidx = np.arange(0, len(xy), qstride)
-    nbrs = tree.query_ball_point(xy[qidx], cfg.radius)
+    qidx_all = np.arange(0, len(xy), qstride)
+
+    def _chunks(step=500):
+        # Neighbour lists for all queries at once take GBs; chunking keeps
+        # peak memory bounded without changing any result.
+        for s in range(0, len(qidx_all), step):
+            q = qidx_all[s:s + step]
+            yield from zip(q, tree.query_ball_point(xy[q], cfg.radius))
 
     windows = {"ref": cfg.ref_window, "local": cfg.local_window, "global": None}
     th = {w: [] for w in windows}
@@ -244,7 +261,7 @@ def wall_metric(scans: dict, poses: dict, cfg: WallCfg = WallCfg(), bins: dict |
     bin_th = {name: {w: [[] for _ in range(len(spec[1]) - 1)] for w in bin_windows}
               for name, spec in (bins or {}).items()}
     patches = []
-    for qi, idx in zip(qidx, nbrs):
+    for qi, idx in _chunks():
         if len(idx) < cfg.min_ref_pts:
             continue
         idx = np.asarray(idx)
@@ -304,20 +321,15 @@ def wall_metric(scans: dict, poses: dict, cfg: WallCfg = WallCfg(), bins: dict |
 # ---------------------------------------------------------------------------
 # Reference-trajectory hook (ATE / RPE)
 # ---------------------------------------------------------------------------
-def ate_rpe(poses: dict, reference_path: str | None):
-    """>>> HOOK: ATE/RPE against a reference trajectory. <<<
-
-    Intended use once a ceiling-camera ground-truth recording exists:
-      1. load the reference (stamp, pose) series from `reference_path`,
-      2. associate DB node stamps to reference stamps (and apply the
-         gt_base_link -> base_link extrinsic),
-      3. SE(2)/SE(3) align, then compute ATE (RMSE of aligned positions) and
-         RPE over fixed path-length / time deltas.
-    Not implemented: there is no reference trajectory yet.  Do not fill with
-    placeholder numbers."""
+def ate_rpe(poses: dict, reference_path: str | None, db_name: str | None = None, time_offset=0.0):
+    """ATE/RPE against a ceiling-camera reference trajectory (bag dir), see gt.py.
+    Returns None when no reference exists for this DB."""
     if reference_path is None:
         return None
-    raise NotImplementedError("ATE/RPE hook: implement when a reference trajectory exists")
+    import gt as G
+    con = connect(db_name)
+    stamps = {i: v[0] for i, v in load_nodes(con).items()}
+    return G.evaluate(poses, stamps, G.load_bag(reference_path)["gt"], time_offset=time_offset)
 
 
 # ---------------------------------------------------------------------------

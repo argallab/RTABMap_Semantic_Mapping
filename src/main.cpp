@@ -1,3 +1,5 @@
+#include <filesystem>
+
 #include <database_exporter.hpp>
 #include <semantic_mapping.hpp>
 #include <wc_database_exporter.hpp>
@@ -16,7 +18,9 @@ int main(int argc, char *argv[])
     std::string model_name = (argc == 3) ? argv[2] : "";
 
     std::cout << "RTAB-Map database: " << rtabmap_database_name << std::endl;
-    auto extractor = std::make_unique<WCDatabaseExporter>(rtabmap_database_name, model_name);
+    // output/<db>/<db>_frozen (the frozen pipeline gives the same result every run, so it reuses the folder)
+    std::string stem = std::filesystem::path(rtabmap_database_name).stem().string();
+    auto extractor = std::make_unique<WCDatabaseExporter>(rtabmap_database_name, model_name, stem + "_frozen", stem);
 
     std::cout << "Loading RTAB-Map database..." << std::endl;
     Result result = extractor->load_rtabmap_db();

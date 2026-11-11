@@ -13,10 +13,22 @@
 
 #include "database_exporter.hpp"
 
+#include <fstream>
+
 DatabaseExporter::DatabaseExporter(std::string rtabmap_database_name,
-                                   std::string model_name)
-  : timestamp_(generate_timestamp_string())
+                                   std::string model_name,
+                                   std::string output_name,
+                                   std::string output_subdir)
+  : timestamp_(output_name.empty() ? generate_timestamp_string() : output_name)
 {
+  output_path_ = std::string(PROJECT_PATH) + "/output/" + (output_subdir.empty() ? "" : output_subdir + "/") + timestamp_;
+  // Output folders may already exist (the frozen pipeline reuses output/<db>_frozen),
+  // so create them if missing and only fail if they still aren't there.
+  auto ensure_dir = [](const std::string &d) {
+    std::error_code ec;
+    std::filesystem::create_directories(d, ec);
+    return std::filesystem::is_directory(d);
+  };
   // initialize variables, create output directories
   if (rtabmap_database_name.empty()) {
     std::cout << "RTABMap database name is empty" << std::endl;
@@ -40,61 +52,68 @@ DatabaseExporter::DatabaseExporter(std::string rtabmap_database_name,
   }
 
   // base path
-  std::string path = std::string(PROJECT_PATH) + "/output/" + timestamp_;
-  if (!std::filesystem::create_directory(path)) {
+  std::string path = output_path_;
+  if (!ensure_dir(path)) {
     std::cout << "Failed to create output directory" << std::endl;
     return;
   }
   // rgb images from every pose in the pose graph in order
-  if (!std::filesystem::create_directory(path + "/images")) {
+  if (!ensure_dir(path + "/images")) {
     std::cout << "Failed to create images directory" << std::endl;
     return;
   }
   // depth images from every pose in the pose graph in order
-  if (!std::filesystem::create_directory(path + "/depths")) {
+  if (!ensure_dir(path + "/depths")) {
     std::cout << "Failed to create depths directory" << std::endl;
     return;
   }
   // full point cloud (.pcl)
-  if (!std::filesystem::create_directory(path + "/cloud")) {
+  if (!ensure_dir(path + "/cloud")) {
     std::cout << "Failed to create cloud directory" << std::endl;
     return;
   }
   // occupancy grid files saved with nav2_map_server (.pgm and .yaml)
-  if (!std::filesystem::create_directory(path + "/grid")) {
+  if (!ensure_dir(path + "/grid")) {
     std::cout << "Failed to create grid directory" << std::endl;
     return;
   }
   // camera matrices for each pose in the pose grpah in .yaml format
-  if (!std::filesystem::create_directory(path + "/camera_models")) {
+  if (!ensure_dir(path + "/camera_models")) {
     std::cout << "Failed to create camera_models directory" << std::endl;
     return;
   }
   // individual .pcl files for objects detected in the environment
-  if (!std::filesystem::create_directory(path + "/objects")) {
+  if (!ensure_dir(path + "/objects")) {
     std::cout << "Failed to create objects directory" << std::endl;
     return;
   }
   // a .yaml file listing the landmarks from semantic mapping (name and xy pos)
-  if (!std::filesystem::create_directory(path + "/landmarks")) {
+  if (!ensure_dir(path + "/landmarks")) {
     std::cout << "Failed to create landmarks directory" << std::endl;
     return;
   }
   // RGB and depth images with YOLOv8 detections overlaid
-  if (!std::filesystem::create_directory(path + "/detections")) {
+  if (!ensure_dir(path + "/detections")) {
     std::cout << "Failed to create detections directory" << std::endl;
     return;
   }
 
-  if (!std::filesystem::create_directory(path + "/cleaned")) {
+  if (!ensure_dir(path + "/cleaned")) {
     std::cout << "Failed to create cleaned directory" << std::endl;
     return;
   }
 
-  if (!std::filesystem::create_directory(path + "/edges")) {
+  if (!ensure_dir(path + "/edges")) {
     std::cout << "Failed to create edges directory" << std::endl;
     return;
   }
+
+  // when and from what this run was made (the folder name no longer says)
+  std::ofstream info(path + "/run_info.txt");
+  info << "started: " << generate_timestamp_string() << "\n"
+       << "database: " << rtabmap_database_name << "\n"
+       << "output: " << timestamp_ << "\n";
+  std::cout << "Output folder: " << path << std::endl;
 }
 
 DatabaseExporter::~DatabaseExporter() {}
